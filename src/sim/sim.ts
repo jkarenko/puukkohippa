@@ -1,0 +1,446 @@
+import { getArena } from './arena.js';
+import {
+  BASE_SPEED,
+  CHARGE_TIME,
+  COUNTDOWN_TIME,
+  DT,
+  KNIFE_CARRIER_SPEED_FACTOR,
+  KNIFE_DECEL,
+  KNIFE_FLY_RADIUS,
+  KNIFE_LENGTH,
+  KNIFE_RECATCH_DELAY,
+  KNIFE_STOP_SPEED,
+  KNIFE_WIDTH,
+  MIN_PLAYERS_TO_START,
+  PLAYER_RADIUS,
+  ROUND_OVER_TIME,
+  RUNNER_SPEED_BONUS_CAP,
+  RUNNER_SPEED_BONUS_PER_CONVERSION,
+  THROW_SPEED_MAX,
+  THROW_SPEED_MIN,
+  TICK_RATE,
+  TURN_RATE,
+} from './constants.js';
+import { circleObbPush, circleRectOverlap, circleRectPush, lerp, wrapAngle } from './geom.js';
+import { Rng, nextSeed } from './rng.js';
+import { pickPassTarget } from './targeting.js';
+import {
+  EMPTY_INPUT,
+  copyInput,
+  type Arena,
+  type Dir,
+  type GameState,
+  type KnifeState,
+  type PlayerInput,
+  type PlayerState,
+} from './types.js';
+
+const DIRS: Dir[] = ['fwd', 'back', 'left', 'right'];
+
+export function createState(seed: number): GameState {
+  return {
+    tick: 0,
+    phase: 'lobby',
+    phaseEndsTick: 0,
+    round: 0,
+    seed: seed >>> 0,
+    players: [],
+    knife: { mode: 'ground', x: 0, y: 0, heading: 0 },
+    conversions: 0,
+    lastCaught: -1,
+    roundStartTick: 0,
+    events: [],
+    nextPlayerId: 1,
+  };
+}
+
+export function findPlayer(state: GameState, id: number): PlayerState | undefined {
+  return state.players.find((p) => p.id === id);
+}
+
+export function runnerSpeedMultiplier(state: GameState): number {
+  return 1 + Math.min(RUNNER_SPEED_BONUS_CAP, RUNNER_SPEED_BONUS_PER_CONVERSION * state.conversions);
+}
+
+export function speedFor(state: GameState, p: PlayerState): number {
+  const runnerSpeed = BASE_SPEED * runnerSpeedMultiplier(state);
+  if (p.role === 'runner') return runnerSpeed;
+  if (state.knife.mode === 'held' && state.knife.holder === p.id) {
+    return runnerSpeed * KNIFE_CARRIER_SPEED_FACTOR;
+  }
+  return BASE_SPEED;
+}
+
+function freeSpawn(state: GameState, arena: Arena, rng: Rng): { x: number; y: number; heading: number } {
+  const order = arena.spawns.slice();
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = rng.int(0, i);
+    const t = order[i]!;
+    order[i] = order[j]!;
+    order[j] = t;
+  }
+  for (const s of order) {
+    let ok = true;
+    for (const p of state.players) {
+      if (Math.hypot(p.x - s.x, p.y - s.y) < PLAYER_RADIUS * 3) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return { x: s.x, y: s.y, heading: rng.float(-Math.PI, Math.PI) };
+  }
+  const s = order[0] ?? { x: arena.width / 2, y: arena.height / 2 };
+  return { x: s.x, y: s.y, heading: 0 };
+}
+
+/** Add a player. Late joiners during a round start as runners. */
+export function addPlayer(state: GameState, name: string, color: number): PlayerState {
+  const arena = getArena(state.seed);
+  const rng = new Rng((state.seed ^ (state.tick * 2654435761)) >>> 0);
+  const pos = freeSpawn(state, arena, rng);
+  const p: PlayerState = {
+    id: state.nextPlayerId++,
+    name,
+    color,
+    x: pos.x,
+    y: pos.y,
+    heading: pos.heading,
+    role: 'runner',
+    charge: -1,
+    caughtTick: -1,
+    catches: 0,
+    wins: 0,
+    prevInput: copyInput(EMPTY_INPUT),
+  };
+  state.players.push(p);
+  return p;
+}
+
+export function removePlayer(state: GameState, id: number): void {
+  const idx = state.players.findIndex((p) => p.id === id);
+  if (idx === -1) return;
+  state.players.splice(idx, 1);
+  if (state.knife.mode === 'held' && state.knife.holder === id) {
+    const p = state.players[idx] ?? state.players[0];
+    // Drop the knife where the player stood, or hand it to someone if the
+    // round is in progress and there is another puukottaja.
+    const other = state.players.find((q) => q.role === 'puukottaja');
+    if (other) state.knife = { mode: 'held', holder: other.id };
+    else state.knife = { mode: 'ground', x: p?.x ?? 100, y: p?.y ?? 100, heading: 0 };
+  }
+  if (state.lastCaught === id) state.lastCaught = -1;
+}
+
+function startRound(state: GameState): void {
+  state.round++;
+  state.seed = nextSeed(state.seed ^ state.round);
+  const arena = getArena(state.seed);
+  const rng = new Rng(state.seed);
+  state.conversions = 0;
+  state.roundStartTick = state.tick;
+  // Place everyone fresh.
+  const placed: PlayerState[] = [];
+  for (const p of state.players) {
+    p.role = 'runner';
+    p.charge = -1;
+    p.caughtTick = -1;
+    p.catches = 0;
+    p.prevInput = copyInput(EMPTY_INPUT);
+    // freeSpawn checks against all players, so temporarily move the unplaced far away.
+    p.x = -10000;
+    p.y = -10000;
+  }
+  for (const p of state.players) {
+    const pos = freeSpawn(state, arena, rng);
+    p.x = pos.x;
+    p.y = pos.y;
+    p.heading = pos.heading;
+    placed.push(p);
+  }
+  let it = state.players.find((p) => p.id === state.lastCaught);
+  if (!it) it = rng.pick(state.players);
+  it.role = 'puukottaja';
+  state.knife = { mode: 'held', holder: it.id };
+  state.phase = 'countdown';
+  state.phaseEndsTick = state.tick + Math.round(COUNTDOWN_TIME * TICK_RATE);
+  state.events.push({ type: 'roundStart', round: state.round });
+}
+
+function convert(state: GameState, who: PlayerState, by: PlayerState, viaKnife: boolean): void {
+  if (who.role === 'puukottaja') return;
+  who.role = 'puukottaja';
+  who.caughtTick = state.tick;
+  who.charge = -1;
+  by.catches++;
+  state.conversions++;
+  state.lastCaught = who.id;
+  state.events.push({ type: 'convert', who: who.id, by: by.id, viaKnife });
+}
+
+function throwKnife(state: GameState, thrower: PlayerState, angle: number, charge: number, target: number): void {
+  const speed = lerp(THROW_SPEED_MIN, THROW_SPEED_MAX, Math.max(0, Math.min(1, charge)));
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const startDist = PLAYER_RADIUS + KNIFE_FLY_RADIUS + 1;
+  const sx = thrower.x + cos * startDist;
+  const sy = thrower.y + sin * startDist;
+  // Point-blank into a wall: the knife stays in hand instead of spawning inside the obstacle.
+  if (hitsObstacle(getArena(state.seed), sx, sy, KNIFE_FLY_RADIUS)) return;
+  state.knife = {
+    mode: 'flying',
+    x: sx,
+    y: sy,
+    heading: angle,
+    vx: cos * speed,
+    vy: sin * speed,
+    thrower: thrower.id,
+    target,
+    airTime: 0,
+  };
+  state.events.push({ type: 'throw', by: thrower.id, target, charge });
+}
+
+function pickup(state: GameState, p: PlayerState): void {
+  state.knife = { mode: 'held', holder: p.id };
+  state.events.push({ type: 'pickup', by: p.id });
+}
+
+function land(state: GameState, x: number, y: number, heading: number): void {
+  state.knife = { mode: 'ground', x, y, heading };
+  state.events.push({ type: 'knifeLanded' });
+}
+
+function resolveObstacles(arena: Arena, p: { x: number; y: number }, r: number): void {
+  // Two passes so corner overlaps settle.
+  for (let pass = 0; pass < 2; pass++) {
+    let any = false;
+    for (const o of arena.obstacles) {
+      const push = circleRectPush(p.x, p.y, r, o);
+      if (push) {
+        p.x += push.x;
+        p.y += push.y;
+        any = true;
+      }
+    }
+    if (!any) break;
+  }
+}
+
+function hitsObstacle(arena: Arena, x: number, y: number, r: number): boolean {
+  for (const o of arena.obstacles) if (circleRectOverlap(x, y, r, o)) return true;
+  return false;
+}
+
+function movePlayer(state: GameState, arena: Arena, p: PlayerState, input: PlayerInput, frozen: boolean): void {
+  if (frozen) return;
+  if (input.left) p.heading -= TURN_RATE * DT;
+  if (input.right) p.heading += TURN_RATE * DT;
+  p.heading = wrapAngle(p.heading);
+  const move = (input.fwd ? 1 : 0) - (input.back ? 1 : 0);
+  if (move !== 0) {
+    const speed = speedFor(state, p) * (move < 0 ? 0.75 : 1);
+    p.x += Math.cos(p.heading) * speed * move * DT;
+    p.y += Math.sin(p.heading) * speed * move * DT;
+  }
+  resolveObstacles(arena, p, PLAYER_RADIUS);
+}
+
+function updateThrowing(state: GameState, p: PlayerState, input: PlayerInput, interactive: boolean): void {
+  const holding = state.knife.mode === 'held' && state.knife.holder === p.id;
+  if (!holding || !interactive) {
+    p.charge = -1;
+    return;
+  }
+  const prev = p.prevInput;
+  if (p.charge < 0) {
+    if (input.throw && !prev.throw) p.charge = 0;
+    return;
+  }
+  if (!input.throw) {
+    // Released: straight throw ahead.
+    throwKnife(state, p, p.heading, p.charge, -1);
+    p.charge = -1;
+    return;
+  }
+  p.charge = Math.min(1, p.charge + DT / CHARGE_TIME);
+  // A freshly pressed direction while charging passes to a fellow puukottaja.
+  for (const d of DIRS) {
+    if (input[d] && !prev[d]) {
+      const mates = state.players.filter((q) => q.role === 'puukottaja' && q.id !== p.id);
+      const target = pickPassTarget(p, mates, d);
+      if (target) {
+        const angle = Math.atan2(target.y - p.y, target.x - p.x);
+        throwKnife(state, p, angle, p.charge, target.id);
+        p.charge = -1;
+      }
+      return;
+    }
+  }
+}
+
+function updateKnife(state: GameState, arena: Arena): void {
+  const k = state.knife;
+  if (k.mode !== 'flying') return;
+  const speed = Math.hypot(k.vx, k.vy);
+  const stepLen = speed * DT;
+  const substeps = Math.max(1, Math.ceil(stepLen / 4));
+  const sx = k.vx * DT / substeps;
+  const sy = k.vy * DT / substeps;
+  for (let s = 0; s < substeps; s++) {
+    const nx = k.x + sx;
+    const ny = k.y + sy;
+    if (hitsObstacle(arena, nx, ny, KNIFE_FLY_RADIUS)) {
+      land(state, k.x, k.y, k.heading);
+      return;
+    }
+    k.x = nx;
+    k.y = ny;
+    for (const p of state.players) {
+      if (Math.hypot(p.x - k.x, p.y - k.y) >= PLAYER_RADIUS + KNIFE_FLY_RADIUS) continue;
+      if (p.id === k.thrower && k.airTime < KNIFE_RECATCH_DELAY) continue;
+      if (p.role === 'runner') {
+        const by = findPlayer(state, k.thrower) ?? p;
+        convert(state, p, by, true);
+      }
+      pickup(state, p);
+      return;
+    }
+  }
+  k.airTime += DT;
+  const newSpeed = speed - KNIFE_DECEL * DT;
+  if (newSpeed <= KNIFE_STOP_SPEED) {
+    land(state, k.x, k.y, k.heading);
+    return;
+  }
+  const f = newSpeed / speed;
+  k.vx *= f;
+  k.vy *= f;
+}
+
+function groundKnifeInteractions(state: GameState): void {
+  const k = state.knife;
+  if (k.mode !== 'ground') return;
+  const halfL = KNIFE_LENGTH / 2;
+  const halfW = KNIFE_WIDTH / 2;
+  for (const p of state.players) {
+    const push = circleObbPush(p.x, p.y, PLAYER_RADIUS, k.x, k.y, k.heading, halfL, halfW);
+    if (!push) continue;
+    if (p.role === 'puukottaja') {
+      pickup(state, p);
+      return;
+    }
+    p.x += push.x;
+    p.y += push.y;
+  }
+}
+
+function playerInteractions(state: GameState, arena: Arena, interactive: boolean): void {
+  const ps = state.players;
+  const minD = PLAYER_RADIUS * 2;
+  for (let i = 0; i < ps.length; i++) {
+    for (let j = i + 1; j < ps.length; j++) {
+      const a = ps[i]!;
+      const b = ps[j]!;
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const d = Math.hypot(dx, dy);
+      if (d >= minD) continue;
+      if (interactive) {
+        if (a.role === 'puukottaja' && b.role === 'runner') convert(state, b, a, false);
+        else if (b.role === 'puukottaja' && a.role === 'runner') convert(state, a, b, false);
+      }
+      // Separate overlapping bodies.
+      const nx = d > 1e-6 ? dx / d : 1;
+      const ny = d > 1e-6 ? dy / d : 0;
+      const push = (minD - d) / 2;
+      a.x -= nx * push;
+      a.y -= ny * push;
+      b.x += nx * push;
+      b.y += ny * push;
+      resolveObstacles(arena, a, PLAYER_RADIUS);
+      resolveObstacles(arena, b, PLAYER_RADIUS);
+    }
+  }
+}
+
+/** Advance the simulation by one fixed tick. Inputs map player id -> input. */
+export function step(state: GameState, inputs: ReadonlyMap<number, PlayerInput>): void {
+  state.tick++;
+  const arena = getArena(state.seed);
+
+  // Phase transitions.
+  switch (state.phase) {
+    case 'lobby':
+      if (state.players.length >= MIN_PLAYERS_TO_START) startRound(state);
+      break;
+    case 'countdown':
+      if (state.players.length < MIN_PLAYERS_TO_START) state.phase = 'lobby';
+      else if (state.tick >= state.phaseEndsTick) state.phase = 'playing';
+      break;
+    case 'playing':
+      if (state.players.length < MIN_PLAYERS_TO_START) state.phase = 'lobby';
+      break;
+    case 'roundover':
+      if (state.tick >= state.phaseEndsTick) {
+        if (state.players.length >= MIN_PLAYERS_TO_START) startRound(state);
+        else state.phase = 'lobby';
+      }
+      break;
+  }
+
+  const phase = state.phase;
+  const interactive = phase === 'playing';
+  const playing = phase === 'playing' || phase === 'countdown';
+
+  for (const p of state.players) {
+    const input = inputs.get(p.id) ?? EMPTY_INPUT;
+    const frozen = phase === 'countdown' && p.role === 'puukottaja';
+    movePlayer(state, arena, p, input, frozen);
+    if (playing) updateThrowing(state, p, input, interactive);
+    else p.charge = -1;
+  }
+
+  if (interactive) {
+    updateKnife(state, arena);
+    groundKnifeInteractions(state);
+  }
+  playerInteractions(state, arena, interactive);
+
+  // Keep the knife holder consistent if the holder vanished.
+  if (state.knife.mode === 'held' && !findPlayer(state, state.knife.holder)) {
+    const other = state.players.find((q) => q.role === 'puukottaja');
+    if (other) state.knife = { mode: 'held', holder: other.id };
+  }
+
+  if (interactive) {
+    const runners = state.players.filter((p) => p.role === 'runner');
+    if (runners.length === 0 && state.players.length >= MIN_PLAYERS_TO_START) {
+      const winner = findPlayer(state, state.lastCaught);
+      if (winner) winner.wins++;
+      state.phase = 'roundover';
+      state.phaseEndsTick = state.tick + Math.round(ROUND_OVER_TIME * TICK_RATE);
+      state.events.push({ type: 'roundOver', winner: winner?.id ?? -1 });
+    }
+  }
+
+  for (const p of state.players) {
+    const input = inputs.get(p.id) ?? EMPTY_INPUT;
+    p.prevInput = copyInput(input);
+  }
+}
+
+export function knifeWorldPosition(state: GameState): { x: number; y: number; heading: number } | null {
+  const k: KnifeState = state.knife;
+  if (k.mode === 'held') {
+    const h = findPlayer(state, k.holder);
+    if (!h) return null;
+    // Carried in the right hand, pointing forward.
+    const side = Math.PI / 2;
+    return {
+      x: h.x + Math.cos(h.heading + side) * (PLAYER_RADIUS * 0.8) + Math.cos(h.heading) * 8,
+      y: h.y + Math.sin(h.heading + side) * (PLAYER_RADIUS * 0.8) + Math.sin(h.heading) * 8,
+      heading: h.heading,
+    };
+  }
+  return { x: k.x, y: k.y, heading: k.heading };
+}

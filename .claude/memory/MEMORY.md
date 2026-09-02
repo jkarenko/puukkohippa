@@ -1,0 +1,1 @@
+- [Headless Chromium visual check](headless-chromium-visual-check.md) — nss libs via apt-get download + LD_LIBRARY_PATH; multi-tab key input is flaky

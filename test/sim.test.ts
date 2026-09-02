@@ -142,6 +142,35 @@ describe('throwing', () => {
     expect(distances[1]!).toBeGreaterThan(distances[0]! * 2);
   });
 
+  it('holding the throw button brings the carrier to a stop with deceleration', () => {
+    const { state, it, runner } = setupPlaying();
+    placeInOpenRow(state, it, 600);
+    runner.x = 60;
+    runner.y = it.y + 400;
+    const inputs = new Map<number, PlayerInput>();
+    inputs.set(it.id, inp({ fwd: true }));
+    run(state, inputs, 30);
+    const movingX = it.x;
+    // Keep holding forward, start charging.
+    inputs.set(it.id, inp({ fwd: true, throw: true }));
+    step(state, inputs); // rising edge: charge starts, this tick still moves at full speed
+    step(state, inputs);
+    const afterOneDecelTick = it.x;
+    expect(afterOneDecelTick).toBeGreaterThan(movingX); // still sliding
+    run(state, inputs, 60);
+    const stoppedX = it.x;
+    step(state, inputs);
+    expect(it.x).toBe(stoppedX); // fully stopped while still charging
+    expect(it.charge).toBeGreaterThan(0);
+    expect(stoppedX - afterOneDecelTick).toBeLessThan(60); // short slide, not a long coast
+    // Releasing throws; movement input works again right after.
+    inputs.set(it.id, inp({ fwd: true }));
+    step(state, inputs);
+    expect(state.knife.mode).toBe('flying');
+    step(state, inputs);
+    expect(it.x).toBeGreaterThan(stoppedX);
+  });
+
   it('a flying knife converts a runner and the runner picks it up', () => {
     const { state, it, runner } = setupPlaying();
     placeInOpenRow(state, it, 400);

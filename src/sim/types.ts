@@ -58,6 +58,8 @@ export interface PlayerState {
   /** Heading in radians, 0 = +x, increasing clockwise on screen. */
   heading: number;
   role: Role;
+  /** Signed movement speed along the heading (px/s); only decays smoothly while charging. */
+  moveSpeed: number;
   /** Throw charge 0..1 while charging, -1 when not charging. */
   charge: number;
   /** Tick at which this player was last converted, -1 if never this round. */

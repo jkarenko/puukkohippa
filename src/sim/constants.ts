@@ -25,6 +25,8 @@ export const KNIFE_CARRIER_SPEED_FACTOR = 0.9;
 export const RUNNER_SPEED_BONUS_PER_CONVERSION = 0.06;
 export const RUNNER_SPEED_BONUS_CAP = 0.6;
 
+/** Deceleration (px/s^2) while the throw button is held; the carrier slides to a stop. */
+export const CHARGE_DECEL = 900;
 /** Seconds of holding the throw button to reach full charge. */
 export const CHARGE_TIME = 1.2;
 export const THROW_SPEED_MIN = 380;

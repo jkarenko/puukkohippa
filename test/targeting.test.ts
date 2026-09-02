@@ -11,6 +11,7 @@ function p(id: number, x: number, y: number, heading = 0): PlayerState {
     y,
     heading,
     role: 'puukottaja',
+    moveSpeed: 0,
     charge: -1,
     caughtTick: -1,
     catches: 0,

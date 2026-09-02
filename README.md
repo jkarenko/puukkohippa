@@ -7,7 +7,8 @@ several such browsers can share one room through a small WebSocket server.
 - **Puukottajat** (red hats) try to touch **runners** (yellow hats). A touched
   runner becomes a puukottaja too.
 - There is exactly one throwable knife, the *puukko*. Whoever carries it moves
-  at 90 % of runner speed. Hold the throw button to charge, release to throw
+  at 90 % of the runners' base speed. Hold the throw button to charge (you
+  stop while charging, turning still works), release to throw
   straight ahead. Tap a direction while charging to pass the knife to the
   nearest fellow puukottaja in that direction.
 - A knife that is still flying converts the runner it hits. A knife lying on

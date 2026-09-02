@@ -1,6 +1,7 @@
 import { getArena } from './arena.js';
 import {
   BASE_SPEED,
+  CHARGE_DECEL,
   CHARGE_TIME,
   COUNTDOWN_TIME,
   DT,
@@ -107,6 +108,7 @@ export function addPlayer(state: GameState, name: string, color: number): Player
     y: pos.y,
     heading: pos.heading,
     role: 'runner',
+    moveSpeed: 0,
     charge: -1,
     caughtTick: -1,
     catches: 0,
@@ -143,6 +145,7 @@ function startRound(state: GameState): void {
   const placed: PlayerState[] = [];
   for (const p of state.players) {
     p.role = 'runner';
+    p.moveSpeed = 0;
     p.charge = -1;
     p.caughtTick = -1;
     p.catches = 0;
@@ -233,15 +236,25 @@ function hitsObstacle(arena: Arena, x: number, y: number, r: number): boolean {
 }
 
 function movePlayer(state: GameState, arena: Arena, p: PlayerState, input: PlayerInput, frozen: boolean): void {
-  if (frozen) return;
+  if (frozen) {
+    p.moveSpeed = 0;
+    return;
+  }
   if (input.left) p.heading -= TURN_RATE * DT;
   if (input.right) p.heading += TURN_RATE * DT;
   p.heading = wrapAngle(p.heading);
-  const move = (input.fwd ? 1 : 0) - (input.back ? 1 : 0);
-  if (move !== 0) {
-    const speed = speedFor(state, p) * (move < 0 ? 0.75 : 1);
-    p.x += Math.cos(p.heading) * speed * move * DT;
-    p.y += Math.sin(p.heading) * speed * move * DT;
+  if (p.charge >= 0) {
+    // Charging a throw: movement input is ignored and the player slides to a stop.
+    const drop = CHARGE_DECEL * DT;
+    if (Math.abs(p.moveSpeed) <= drop) p.moveSpeed = 0;
+    else p.moveSpeed -= Math.sign(p.moveSpeed) * drop;
+  } else {
+    const move = (input.fwd ? 1 : 0) - (input.back ? 1 : 0);
+    p.moveSpeed = move === 0 ? 0 : speedFor(state, p) * (move < 0 ? 0.75 : 1) * move;
+  }
+  if (p.moveSpeed !== 0) {
+    p.x += Math.cos(p.heading) * p.moveSpeed * DT;
+    p.y += Math.sin(p.heading) * p.moveSpeed * DT;
   }
   resolveObstacles(arena, p, PLAYER_RADIUS);
 }

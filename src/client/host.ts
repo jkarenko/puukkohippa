@@ -148,17 +148,28 @@ const KNIFE_PREDICTION_TIMEOUT_TICKS = 90;
 
 const SESSION_KEY = 'puukkohippa-session';
 
+/**
+ * Random id that also works on plain-http origins, where browsers do not
+ * expose `crypto.randomUUID` (it is secure-context only).
+ */
+function randomId(): string {
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) crypto.getRandomValues(bytes);
+  else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 /** Stable per-tab id so a reconnect resumes the same players. */
 function sessionId(): string {
   try {
     let id = sessionStorage.getItem(SESSION_KEY);
     if (!id) {
-      id = crypto.randomUUID();
+      id = randomId();
       sessionStorage.setItem(SESSION_KEY, id);
     }
     return id;
   } catch {
-    return crypto.randomUUID();
+    return randomId();
   }
 }
 

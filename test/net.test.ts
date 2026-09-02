@@ -3,8 +3,8 @@ import { decode, encode } from '../src/net/protocol.js';
 import { Room } from '../src/net/room.js';
 import { getArena } from '../src/sim/arena.js';
 import { COUNTDOWN_TIME, TICK_RATE } from '../src/sim/constants.js';
-import { predictLocalPlayer } from '../src/sim/sim.js';
-import { EMPTY_INPUT, copyInput, type GameState, type PlayerInput } from '../src/sim/types.js';
+import { createThrow, flyKnife, predictLocalPlayer } from '../src/sim/sim.js';
+import { EMPTY_INPUT, copyInput, type GameState, type KnifeState, type PlayerInput } from '../src/sim/types.js';
 
 function inp(partial: Partial<PlayerInput> = {}): PlayerInput {
   return { ...EMPTY_INPUT, ...partial };
@@ -111,5 +111,72 @@ describe('client prediction', () => {
     expect(predicted.y).toBeCloseTo(server.y, 6);
     expect(predicted.heading).toBeCloseTo(server.heading, 6);
     expect(predicted.moveSpeed).toBeCloseTo(server.moveSpeed, 6);
+  });
+});
+
+describe('disconnect handling', () => {
+  it('a disconnected holder drops the knife, stands still, and is dimmed until reconnected', () => {
+    const room = new Room(7);
+    const a = room.addPlayer('A', 1);
+    room.addPlayer('B', 2);
+    for (let i = 0; i < COUNTDOWN_TIME * TICK_RATE + 5; i++) room.tick();
+    const holder = room.state.players.find((p) => p.role === 'puukottaja')!;
+    room.pushInput(holder.id, 1, inp({ fwd: true }));
+    room.tick();
+    room.setConnected(holder.id, false);
+    expect(holder.connected).toBe(false);
+    expect(room.state.knife.mode).toBe('ground');
+    const x = holder.x;
+    room.pushInput(holder.id, 2, inp({ fwd: true })); // input from the dead socket is discarded
+    room.tick();
+    expect(holder.x).toBe(x);
+    room.setConnected(holder.id, true);
+    expect(holder.connected).toBe(true);
+    void a;
+  });
+});
+
+describe('knife prediction', () => {
+  it('a predicted throw lands exactly where the server knife lands', () => {
+    const room = new Room(2024);
+    room.addPlayer('A', 1);
+    room.addPlayer('B', 2);
+    for (let i = 0; i < COUNTDOWN_TIME * TICK_RATE + 5; i++) room.tick();
+    const holder = room.state.players.find((p) => p.role === 'puukottaja')!;
+    const other = room.state.players.find((p) => p.role === 'runner')!;
+    // Face the arena centre so the throw has room; park the runner far away.
+    holder.heading = Math.atan2(450 - holder.y, 800 - holder.x);
+    const spawns = getArena(room.state.seed).spawns;
+    const far = spawns.reduce((best, s) =>
+      Math.hypot(s.x - holder.x, s.y - holder.y) > Math.hypot(best.x - holder.x, best.y - holder.y) ? s : best,
+    );
+    other.x = far.x;
+    other.y = far.y;
+
+    const snapshot = overWire(room.state);
+    const arena = getArena(snapshot.seed);
+    const predicted = { ...snapshot.players.find((p) => p.id === holder.id)!, prevInput: copyInput(EMPTY_INPUT) };
+    let predictedKnife: KnifeState | null = null;
+    const inputs: PlayerInput[] = [];
+    for (let k = 0; k < 40; k++) inputs.push(inp({ throw: k < 25 }));
+    inputs.forEach((input, i) => {
+      const chargeBefore = predicted.charge;
+      const intent = predictLocalPlayer(snapshot, predicted, input);
+      if (intent.kind === 'straight') predictedKnife = createThrow(arena, predicted, predicted.heading, chargeBefore, -1);
+      if (predictedKnife?.mode === 'flying') predictedKnife = flyKnife(arena, predictedKnife, null);
+      room.pushInput(holder.id, i + 1, input);
+      if (i >= 2) room.tick();
+    });
+    for (let i = 0; i < 200; i++) {
+      room.tick();
+      if (predictedKnife?.mode === 'flying') predictedKnife = flyKnife(arena, predictedKnife, null);
+    }
+    expect(predictedKnife).not.toBeNull();
+    expect(predictedKnife!.mode).toBe('ground');
+    expect(room.state.knife.mode).toBe('ground');
+    const pk = predictedKnife as { x: number; y: number };
+    const sk = room.state.knife as { x: number; y: number };
+    expect(pk.x).toBeCloseTo(sk.x, 6);
+    expect(pk.y).toBeCloseTo(sk.y, 6);
   });
 });

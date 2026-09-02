@@ -1,4 +1,4 @@
-import { addPlayer, createState, removePlayer, step } from '../sim/sim.js';
+import { addPlayer, createState, dropKnife, findPlayer, removePlayer, step } from '../sim/sim.js';
 import { EMPTY_INPUT, copyInput, type GameEvent, type GameState, type PlayerInput } from '../sim/types.js';
 
 /** Inputs buffered ahead of the simulation; beyond this the oldest are dropped. */
@@ -45,16 +45,31 @@ export class Room {
     this.acks.delete(id);
   }
 
+  /**
+   * Mark a player's connection state. A disconnected player stands still,
+   * drops the knife, and is drawn dimmed until removed or reconnected.
+   */
+  setConnected(id: number, connected: boolean): void {
+    const p = findPlayer(this.state, id);
+    if (!p) return;
+    p.connected = connected;
+    if (!connected) {
+      this.inputs.set(id, copyInput(EMPTY_INPUT));
+      this.queues.set(id, []);
+      dropKnife(this.state, id);
+    }
+  }
+
   /** Apply an input immediately from the next tick on (no sequencing). */
   setInput(id: number, input: PlayerInput): void {
-    if (!this.inputs.has(id)) return;
+    if (!this.inputs.has(id) || !findPlayer(this.state, id)?.connected) return;
     this.inputs.set(id, copyInput(input));
   }
 
   /** Queue a sequenced input. Out-of-order or duplicate seqs are ignored. */
   pushInput(id: number, seq: number, input: PlayerInput): void {
     const q = this.queues.get(id);
-    if (!q) return;
+    if (!q || !findPlayer(this.state, id)?.connected) return;
     const last = q.length ? q[q.length - 1]!.seq : (this.acks.get(id) ?? 0);
     if (seq <= last) return;
     q.push({ seq, input: copyInput(input) });

@@ -54,7 +54,7 @@ export class Renderer {
     const seen = new Set<number>();
     for (const p of state.players) {
       seen.add(p.id);
-      this.drawPlayer(p, state);
+      this.drawPlayer(p, state, p.connected ? 1 : 0.35);
       this.updateLabel(p, localLabels.get(p.id));
     }
     for (const [id, label] of this.labels) {
@@ -80,7 +80,7 @@ export class Renderer {
     for (const o of arena.obstacles) g.strokeRect(o.x + 1, o.y + 1, o.w - 2, o.h - 2);
   }
 
-  private drawPlayer(p: PlayerState, state: GameState): void {
+  private drawPlayer(p: PlayerState, state: GameState, alpha: number): void {
     const g = this.gfx;
     const cos = Math.cos(p.heading);
     const sin = Math.sin(p.heading);
@@ -98,26 +98,26 @@ export class Renderer {
     }
 
     // Shoulders / body (the bright player colour), slightly oval across the heading.
-    g.fillStyle(p.color, 1);
+    g.fillStyle(p.color, alpha);
     g.fillEllipse(p.x, p.y, r * 2.2, r * 2.0);
-    g.lineStyle(2, 0x000000, 0.6);
+    g.lineStyle(2, 0x000000, 0.6 * alpha);
     g.strokeEllipse(p.x, p.y, r * 2.2, r * 2.0);
     // Arms as two stubs to the sides.
-    g.fillStyle(p.color, 1);
+    g.fillStyle(p.color, alpha);
     g.fillCircle(p.x - sin * r * 1.05, p.y + cos * r * 1.05, 5);
     g.fillCircle(p.x + sin * r * 1.05, p.y - cos * r * 1.05, 5);
 
     // Hat: brim ring, then crown.
-    g.fillStyle(hat, 1);
+    g.fillStyle(hat, alpha);
     g.fillCircle(p.x, p.y, r * 0.66);
-    g.lineStyle(3, darken(hat, 0.55), 1);
+    g.lineStyle(3, darken(hat, 0.55), alpha);
     g.strokeCircle(p.x, p.y, r * 0.66);
-    g.fillStyle(lighten(hat, 0.25), 1);
+    g.fillStyle(lighten(hat, 0.25), alpha);
     g.fillCircle(p.x - cos * 2, p.y - sin * 2, r * 0.36);
     // Visor / nose pointing along the heading.
     const nx = p.x + cos * (r * 0.66);
     const ny = p.y + sin * (r * 0.66);
-    g.fillStyle(darken(hat, 0.5), 1);
+    g.fillStyle(darken(hat, 0.5), alpha);
     g.fillTriangle(
       nx + cos * 6,
       ny + sin * 6,
@@ -140,7 +140,7 @@ export class Renderer {
         100,
         Math.round(p.charge * 100),
       );
-      g.fillStyle(Phaser.Display.Color.GetColor(c.r, c.g, c.b), 1);
+      g.fillStyle(Phaser.Display.Color.GetColor(c.r, c.g, c.b), alpha);
       g.fillRect(x0, y0, w * p.charge, 5);
       void CHARGE_TIME;
     }
@@ -179,7 +179,7 @@ export class Renderer {
 
   private updateLabel(p: PlayerState, localLabel: string | undefined): void {
     let t = this.labels.get(p.id);
-    const text = localLabel ? `${p.name} · ${localLabel}` : p.name;
+    const text = (localLabel ? `${p.name} · ${localLabel}` : p.name) + (p.connected ? '' : ' (offline)');
     if (!t) {
       t = this.scene.add
         .text(0, 0, text, {

@@ -2,12 +2,15 @@ import { PROTOCOL_VERSION, decode, encode, type ClientMsg, type ServerMsg } from
 import { Room } from '../net/room.js';
 import { TICK_RATE } from '../sim/constants.js';
 import { lerp, lerpAngle } from '../sim/geom.js';
-import { predictLocalPlayer } from '../sim/sim.js';
+import { getArena } from '../sim/arena.js';
+import { createThrow, flyKnife, predictLocalPlayer, touchesGroundKnife } from '../sim/sim.js';
 import {
   EMPTY_INPUT,
   copyInput,
+  type FlyingKnife,
   type GameEvent,
   type GameState,
+  type KnifeState,
   type PlayerInput,
   type PlayerState,
 } from '../sim/types.js';
@@ -121,6 +124,38 @@ interface LocalPlayer {
   errHeading: number;
 }
 
+/**
+ * The client's belief about the knife while the server has not confirmed a
+ * local throw or pickup yet. Deterministic flight means a predicted throw
+ * lands exactly where the server's will.
+ */
+interface KnifePrediction {
+  knife: KnifeState;
+  kind: 'throw' | 'pickup';
+  /** Player the prediction belongs to (thrower or picker). */
+  by: number;
+  sinceTick: number;
+}
+
+/** Give up on a knife prediction the server never confirmed after this many client ticks. */
+const KNIFE_PREDICTION_TIMEOUT_TICKS = 90;
+
+const SESSION_KEY = 'puukkohippa-session';
+
+/** Stable per-tab id so a reconnect resumes the same players. */
+function sessionId(): string {
+  try {
+    let id = sessionStorage.getItem(SESSION_KEY);
+    if (!id) {
+      id = crypto.randomUUID();
+      sessionStorage.setItem(SESSION_KEY, id);
+    }
+    return id;
+  } catch {
+    return crypto.randomUUID();
+  }
+}
+
 /** Render remote players this many ticks behind the estimated server tick. */
 const INTERP_DELAY_TICKS = 7; // ~117 ms: two snapshot intervals plus jitter margin
 /** How fast reconciliation errors are smoothed out (fraction per second). */
@@ -138,6 +173,8 @@ export class NetHost implements Host {
   private pendingEvents: GameEvent[] = [];
   private readonly slots = new Map<string, { name: string; color: number; id: number | null }>();
   private readonly local = new Map<number, LocalPlayer>();
+  private readonly session = sessionId();
+  private knifePred: KnifePrediction | null = null;
   private clientTick = 0;
   private acc = 0;
   private last = -1;
@@ -162,7 +199,7 @@ export class NetHost implements Host {
     const ws = new WebSocket(this.url);
     this.ws = ws;
     ws.onopen = () => {
-      this.send({ t: 'hello', room: this.room, v: PROTOCOL_VERSION });
+      this.send({ t: 'hello', room: this.room, v: PROTOCOL_VERSION, session: this.session });
       // Re-register every slot we already had (reconnect case).
       for (const [slot, s] of this.slots) {
         s.id = null;
@@ -175,9 +212,15 @@ export class NetHost implements Host {
       const msg = decode<ServerMsg>(String(ev.data));
       if (msg) this.handle(msg);
     };
-    ws.onclose = () => {
-      this.status = 'disconnected, retrying…';
+    ws.onclose = (ev) => {
       this.snapshots.length = 0;
+      this.knifePred = null;
+      if (ev.code === 4000) {
+        // Another tab with the same session took over; do not fight it.
+        this.status = 'this session is open in another tab';
+        return;
+      }
+      this.status = 'disconnected, retrying…';
       if (!this.closed) this.reconnectTimer = setTimeout(() => this.connect(), 1500);
     };
     ws.onerror = () => {
@@ -197,6 +240,7 @@ export class NetHost implements Host {
       case 'joined': {
         const s = this.slots.get(msg.slot);
         if (s) s.id = msg.id;
+        if (this.local.has(msg.id)) break; // reconnect re-announcing an existing player
         this.local.set(msg.id, {
           cur: copyInput(EMPTY_INPUT),
           pending: [],
@@ -235,6 +279,26 @@ export class NetHost implements Host {
     this.tickOffset = this.tickOffset === null ? off : this.tickOffset + (off - this.tickOffset) * 0.1;
 
     this.reconcile(state, acks);
+    this.reconcileKnife(state);
+  }
+
+  /** Drop the knife prediction once the server has caught up with it (or clearly disagrees). */
+  private reconcileKnife(state: GameState): void {
+    const kp = this.knifePred;
+    if (!kp) return;
+    const k = state.knife;
+    if (kp.kind === 'throw') {
+      // Keep the predicted flight while the server still shows the knife in the
+      // thrower's hand (not applied yet) or flying (same deterministic path);
+      // switch to truth when it has landed or someone caught it.
+      const stillOurs = k.mode === 'held' && k.holder === kp.by;
+      const flying = k.mode === 'flying' && k.thrower === kp.by;
+      if (!stillOurs && !flying) this.knifePred = null;
+      else if (flying && kp.knife.mode === 'ground') this.knifePred = null;
+    } else {
+      // Pickup confirmed, or the knife went somewhere else entirely.
+      if (k.mode === 'held' || k.mode === 'flying') this.knifePred = null;
+    }
   }
 
   /** Rebuild each local player's prediction from the authoritative snapshot. */
@@ -307,14 +371,72 @@ export class NetHost implements Host {
         lp.pending.push({ seq: this.clientTick, input });
         if (lp.pending.length > 120) lp.pending.shift(); // 2 s without acks: stop growing
         batch.push({ id, input });
-        if (lp.predicted && latest) predictLocalPlayer(latest, lp.predicted, input);
+        if (lp.predicted && latest) {
+          const chargeBefore = lp.predicted.charge;
+          const intent = predictLocalPlayer(latest, lp.predicted, input);
+          this.predictKnife(latest, lp.predicted, intent.kind === 'none' ? null : { intent, charge: chargeBefore });
+        }
       }
       this.send({ t: 'input', seq: this.clientTick, inputs: batch });
+      this.stepKnifePrediction(latest);
     }
     if (nowMs - this.lastPingAt > 2000) {
       this.lastPingAt = nowMs;
       this.send({ t: 'ping', sent: performance.now() });
     }
+  }
+
+  /** Start a knife prediction for a local player's throw or pickup. */
+  private predictKnife(
+    latest: GameState,
+    p: PlayerState,
+    release: { intent: ReturnType<typeof predictLocalPlayer>; charge: number } | null,
+  ): void {
+    if (this.knifePred) {
+      if (this.clientTick - this.knifePred.sinceTick > KNIFE_PREDICTION_TIMEOUT_TICKS) this.knifePred = null;
+      else return;
+    }
+    const serverKnife = latest.knife;
+    const arena = getArena(latest.seed);
+    if (release && serverKnife.mode === 'held' && serverKnife.holder === p.id) {
+      const it = release.intent;
+      let angle = p.heading;
+      let target = -1;
+      if (it.kind === 'pass') {
+        angle = Math.atan2(it.target.y - p.y, it.target.x - p.x);
+        target = it.target.id;
+      }
+      const knife = createThrow(arena, p, angle, release.charge, target);
+      if (knife) this.knifePred = { knife, kind: 'throw', by: p.id, sinceTick: this.clientTick };
+      return;
+    }
+    if (p.role === 'puukottaja' && latest.phase === 'playing' && touchesGroundKnife(this.presentKnife(latest) ?? serverKnife, p)) {
+      this.knifePred = { knife: { mode: 'held', holder: p.id }, kind: 'pickup', by: p.id, sinceTick: this.clientTick };
+    }
+  }
+
+  private stepKnifePrediction(latest: GameState | null): void {
+    const kp = this.knifePred;
+    if (!kp || !latest || kp.knife.mode !== 'flying') return;
+    const result = flyKnife(getArena(latest.seed), { ...kp.knife }, null);
+    kp.knife = result;
+  }
+
+  /**
+   * The newest server knife advanced to "now" when a local player threw it,
+   * so it lines up with that player's predicted position. Remote throws are
+   * left to the interpolated view (which matches the remote players).
+   */
+  private presentKnife(latest: GameState): KnifeState | null {
+    const k = latest.knife;
+    if (k.mode !== 'flying' || !this.local.has(k.thrower)) return null;
+    const newest = this.snapshots[this.snapshots.length - 1];
+    if (!newest) return null;
+    const ahead = Math.max(0, Math.min(10, Math.round((performance.now() - newest.at) / TICK_MS)));
+    const arena = getArena(latest.seed);
+    let cur: KnifeState = { ...k };
+    for (let i = 0; i < ahead && cur.mode === 'flying'; i++) cur = flyKnife(arena, cur as FlyingKnife, null);
+    return cur;
   }
 
   frame(nowMs: number): Frame {
@@ -336,7 +458,9 @@ export class NetHost implements Host {
       lp.errHeading *= decay;
       return { ...lp.predicted, x: lp.predicted.x + lp.errX, y: lp.predicted.y + lp.errY, heading: lp.predicted.heading + lp.errHeading };
     });
-    return { state: { ...base, players }, events };
+    const latest = this.snapshots[this.snapshots.length - 1]?.state ?? base;
+    const knife = this.knifePred?.knife ?? this.presentKnife(latest) ?? base.knife;
+    return { state: { ...base, players, knife }, events };
   }
 
   /** Remote view of the world at the render tick, interpolated by server tick. */

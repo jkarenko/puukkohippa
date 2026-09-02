@@ -47,13 +47,32 @@ src/client   Phaser 4: input slots, host abstraction, renderer, HUD
   still-pending inputs, and smooths any visual difference out over about
   60 ms (corrections above 120 px snap). The HUD shows RTT, the number of
   unacknowledged inputs and the size of the last correction.
+- The knife is predicted for local players too. When prediction sees a
+  local charge release it spawns the same flying knife the server will
+  (`createThrow`) and flies it with the same deterministic code (`flyKnife`),
+  so it leaves the hand instantly and lands where the server's lands; the
+  prediction is dropped once the server shows the knife landed or caught,
+  or after 1.5 s without confirmation. Walking a local puukottaja onto a
+  resting knife predicts the pickup the same way. A server knife thrown by
+  a local player is shown advanced to the present rather than 117 ms behind,
+  so it lines up with the predicted thrower; remote throws stay on the
+  interpolated timeline, which matches the remote players they interact with.
 - Remote players and the flying knife are interpolated between snapshots on
   a server-tick timeline: the client estimates the offset between local time
   and server ticks from snapshot arrival times (smoothed) and renders 7 ticks
   (~117 ms) behind, so network jitter does not translate into stutter.
 - Mixed couch + online: every client can register several local players
-  (one per control slot). The server tracks which player ids belong to which
-  socket and removes them on disconnect.
+  (one per control slot). Ownership is per *session* (a random id kept in
+  the tab's `sessionStorage`), not per socket: a reconnect with the same
+  session id gets the same players and ids back. When a socket drops, its
+  players stay for a 10 s grace period marked `connected: false` (drawn
+  dimmed and "(offline)"), stand still, drop the knife and cannot pick it up
+  or send input; after the grace period they are removed. The server pings
+  every socket every 5 s and terminates one that misses a pong, so a
+  vanished client (sleeping laptop, dead wifi) enters the grace period within
+  about 10 s instead of hours. A second tab opening the same session
+  replaces the first, which stops reconnecting rather than fighting back.
+  Clean page unloads still close the socket immediately.
 - Arenas are generated from a seed by `generateArena`, and both sides call
   the same function, so the arena is never sent over the wire. Generation
   places blocks, walls and L-shaped corner walls with a minimum corridor
@@ -80,5 +99,7 @@ on the ground it has a soft shadow so its blocking footprint is visible.
 - Delta-compressed or binary snapshots (currently full JSON state at 20 Hz,
   roughly 200 bytes per player; fine for 32 players on a LAN or a decent
   connection).
-- Extrapolation of remote players when snapshots are late, and predicting
-  the local player's own throw so the knife leaves the hand instantly.
+- Extrapolation of remote players when snapshots are late.
+- Lag compensation for touches and knife hits (rewinding remote players to
+  the thrower's view) if online play across the internet feels unfair.
+- Idle kick for players who send no input for a long time in the lobby.

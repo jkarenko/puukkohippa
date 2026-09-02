@@ -68,6 +68,8 @@ export interface PlayerState {
   catches: number;
   /** Rounds survived as the last runner. */
   wins: number;
+  /** False while the owning connection is in its reconnect grace period. */
+  connected: boolean;
   /** Previous tick's input, used for edge detection. */
   prevInput: PlayerInput;
 }
@@ -119,3 +121,11 @@ export interface GameState {
 }
 
 export type Dir = 'fwd' | 'back' | 'left' | 'right';
+
+/** What a charge release wants to do; produced by the shared charge logic. */
+export type ThrowIntent =
+  | { kind: 'none' }
+  | { kind: 'straight' }
+  | { kind: 'pass'; target: PlayerState };
+
+export type FlyingKnife = Extract<KnifeState, { mode: 'flying' }>;

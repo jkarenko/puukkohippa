@@ -30,10 +30,12 @@ import {
   copyInput,
   type Arena,
   type Dir,
+  type FlyingKnife,
   type GameState,
   type KnifeState,
   type PlayerInput,
   type PlayerState,
+  type ThrowIntent,
 } from './types.js';
 
 const DIRS: Dir[] = ['fwd', 'back', 'left', 'right'];
@@ -113,6 +115,7 @@ export function addPlayer(state: GameState, name: string, color: number): Player
     caughtTick: -1,
     catches: 0,
     wins: 0,
+    connected: true,
     prevInput: copyInput(EMPTY_INPUT),
   };
   state.players.push(p);
@@ -181,26 +184,31 @@ function convert(state: GameState, who: PlayerState, by: PlayerState, viaKnife: 
   state.events.push({ type: 'convert', who: who.id, by: by.id, viaKnife });
 }
 
-function throwKnife(state: GameState, thrower: PlayerState, angle: number, charge: number, target: number): void {
+/**
+ * Build the flying knife for a throw, or null when the knife would spawn
+ * inside a wall (point-blank throw into an obstacle: it stays in hand).
+ */
+export function createThrow(
+  arena: Arena,
+  thrower: PlayerState,
+  angle: number,
+  charge: number,
+  target: number,
+): FlyingKnife | null {
   const speed = lerp(THROW_SPEED_MIN, THROW_SPEED_MAX, Math.max(0, Math.min(1, charge)));
   const cos = Math.cos(angle);
   const sin = Math.sin(angle);
   const startDist = PLAYER_RADIUS + KNIFE_FLY_RADIUS + 1;
   const sx = thrower.x + cos * startDist;
   const sy = thrower.y + sin * startDist;
-  // Point-blank into a wall: the knife stays in hand instead of spawning inside the obstacle.
-  if (hitsObstacle(getArena(state.seed), sx, sy, KNIFE_FLY_RADIUS)) return;
-  state.knife = {
-    mode: 'flying',
-    x: sx,
-    y: sy,
-    heading: angle,
-    vx: cos * speed,
-    vy: sin * speed,
-    thrower: thrower.id,
-    target,
-    airTime: 0,
-  };
+  if (hitsObstacle(arena, sx, sy, KNIFE_FLY_RADIUS)) return null;
+  return { mode: 'flying', x: sx, y: sy, heading: angle, vx: cos * speed, vy: sin * speed, thrower: thrower.id, target, airTime: 0 };
+}
+
+function throwKnife(state: GameState, thrower: PlayerState, angle: number, charge: number, target: number): void {
+  const k = createThrow(getArena(state.seed), thrower, angle, charge, target);
+  if (!k) return;
+  state.knife = k;
   state.events.push({ type: 'throw', by: thrower.id, target, charge });
 }
 
@@ -259,13 +267,11 @@ function movePlayer(state: GameState, arena: Arena, p: PlayerState, input: Playe
   resolveObstacles(arena, p, PLAYER_RADIUS);
 }
 
-type ChargeResult = { kind: 'none' } | { kind: 'straight' } | { kind: 'pass'; target: PlayerState };
-
 /**
  * Charge bookkeeping shared by the authoritative step and client prediction.
  * Mutates `p.charge` and reports whether a throw should happen this tick.
  */
-function updateCharge(state: GameState, p: PlayerState, input: PlayerInput, interactive: boolean): ChargeResult {
+function updateCharge(state: GameState, p: PlayerState, input: PlayerInput, interactive: boolean): ThrowIntent {
   const holding = state.knife.mode === 'held' && state.knife.holder === p.id;
   if (!holding || !interactive) {
     p.charge = -1;
@@ -305,9 +311,12 @@ function updateThrowing(state: GameState, p: PlayerState, input: PlayerInput, in
   }
 }
 
-function updateKnife(state: GameState, arena: Arena): void {
-  const k = state.knife;
-  if (k.mode !== 'flying') return;
+/**
+ * Advance a flying knife one tick against the arena. `onSubstep` runs after
+ * each sub-movement and returns true if something caught the knife. Returns
+ * the knife's new state: itself while still flying, or a ground state.
+ */
+export function flyKnife(arena: Arena, k: FlyingKnife, onSubstep: ((k: FlyingKnife) => boolean) | null): KnifeState {
   const speed = Math.hypot(k.vx, k.vy);
   const stepLen = speed * DT;
   const substeps = Math.max(1, Math.ceil(stepLen / 4));
@@ -316,32 +325,57 @@ function updateKnife(state: GameState, arena: Arena): void {
   for (let s = 0; s < substeps; s++) {
     const nx = k.x + sx;
     const ny = k.y + sy;
-    if (hitsObstacle(arena, nx, ny, KNIFE_FLY_RADIUS)) {
-      land(state, k.x, k.y, k.heading);
-      return;
-    }
+    if (hitsObstacle(arena, nx, ny, KNIFE_FLY_RADIUS)) return { mode: 'ground', x: k.x, y: k.y, heading: k.heading };
     k.x = nx;
     k.y = ny;
-    for (const p of state.players) {
-      if (Math.hypot(p.x - k.x, p.y - k.y) >= PLAYER_RADIUS + KNIFE_FLY_RADIUS) continue;
-      if (p.id === k.thrower && k.airTime < KNIFE_RECATCH_DELAY) continue;
-      if (p.role === 'runner') {
-        const by = findPlayer(state, k.thrower) ?? p;
-        convert(state, p, by, true);
-      }
-      pickup(state, p);
-      return;
-    }
+    if (onSubstep && onSubstep(k)) return k;
   }
   k.airTime += DT;
   const newSpeed = speed - KNIFE_DECEL * DT;
-  if (newSpeed <= KNIFE_STOP_SPEED) {
-    land(state, k.x, k.y, k.heading);
-    return;
-  }
+  if (newSpeed <= KNIFE_STOP_SPEED) return { mode: 'ground', x: k.x, y: k.y, heading: k.heading };
   const f = newSpeed / speed;
   k.vx *= f;
   k.vy *= f;
+  return k;
+}
+
+function updateKnife(state: GameState, arena: Arena): void {
+  const k = state.knife;
+  if (k.mode !== 'flying') return;
+  let caught = false;
+  const result = flyKnife(arena, k, (fk) => {
+    for (const p of state.players) {
+      if (Math.hypot(p.x - fk.x, p.y - fk.y) >= PLAYER_RADIUS + KNIFE_FLY_RADIUS) continue;
+      if (p.id === fk.thrower && fk.airTime < KNIFE_RECATCH_DELAY) continue;
+      if (p.role === 'runner') {
+        const by = findPlayer(state, fk.thrower) ?? p;
+        convert(state, p, by, true);
+      }
+      // A disconnected player is a sitting duck but must not hold the knife.
+      if (p.connected) pickup(state, p);
+      else land(state, fk.x, fk.y, fk.heading);
+      caught = true;
+      return true;
+    }
+    return false;
+  });
+  if (caught) return;
+  if (result.mode === 'ground') land(state, result.x, result.y, result.heading);
+}
+
+/** Whether a puukottaja at this position would pick up a resting knife. */
+export function touchesGroundKnife(k: KnifeState, p: PlayerState): boolean {
+  if (k.mode !== 'ground') return false;
+  return circleObbPush(p.x, p.y, PLAYER_RADIUS, k.x, k.y, k.heading, KNIFE_LENGTH / 2, KNIFE_WIDTH / 2) !== null;
+}
+
+/** Drop a held knife at the holder's feet (used when the holder disconnects). */
+export function dropKnife(state: GameState, id: number): void {
+  if (state.knife.mode !== 'held' || state.knife.holder !== id) return;
+  const p = findPlayer(state, id);
+  if (!p) return;
+  p.charge = -1;
+  land(state, p.x, p.y, p.heading);
 }
 
 /** Push a runner out of the ground knife. Returns true if the player touched it. */
@@ -359,7 +393,7 @@ function groundKnifePush(state: GameState, p: PlayerState): boolean {
 
 function groundKnifeInteractions(state: GameState): void {
   for (const p of state.players) {
-    if (groundKnifePush(state, p) && p.role === 'puukottaja') {
+    if (groundKnifePush(state, p) && p.role === 'puukottaja' && p.connected) {
       pickup(state, p);
       return;
     }
@@ -468,15 +502,17 @@ export function step(state: GameState, inputs: ReadonlyMap<number, PlayerInput>)
  * from `state` (phase, knife holder, conversions, other players) comes from
  * the last snapshot; only `p` is mutated.
  */
-export function predictLocalPlayer(state: GameState, p: PlayerState, input: PlayerInput): void {
+export function predictLocalPlayer(state: GameState, p: PlayerState, input: PlayerInput): ThrowIntent {
   const arena = getArena(state.seed);
   const phase = state.phase;
   const frozen = phase === 'countdown' && p.role === 'puukottaja';
   movePlayer(state, arena, p, input, frozen);
-  if (phase === 'playing' || phase === 'countdown') updateCharge(state, p, input, phase === 'playing');
+  let intent: ThrowIntent = { kind: 'none' };
+  if (phase === 'playing' || phase === 'countdown') intent = updateCharge(state, p, input, phase === 'playing');
   else p.charge = -1;
   if (phase === 'playing') groundKnifePush(state, p);
   p.prevInput = copyInput(input);
+  return intent;
 }
 
 export function knifeWorldPosition(state: GameState): { x: number; y: number; heading: number } | null {

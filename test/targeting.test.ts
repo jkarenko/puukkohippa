@@ -16,6 +16,7 @@ function p(id: number, x: number, y: number, heading = 0): PlayerState {
     caughtTick: -1,
     catches: 0,
     wins: 0,
+    connected: true,
     prevInput: copyInput(EMPTY_INPUT),
   };
 }

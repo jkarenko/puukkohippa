@@ -4,7 +4,8 @@ export const DEFAULT_PORT = 8787;
 export const PROTOCOL_VERSION = 2;
 
 export type ClientMsg =
-  | { t: 'hello'; room: string; v: number }
+  /** `session` identifies this browser tab across reconnects. */
+  | { t: 'hello'; room: string; v: number; session: string }
   | { t: 'join'; slot: string; name: string; color: number }
   | { t: 'leave'; id: number }
   /** One client tick worth of inputs. `seq` is the client's tick counter. */

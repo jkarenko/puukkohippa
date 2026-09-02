@@ -58,6 +58,7 @@ Up to 32 players per room.
 | `room`    | Join an online room with this name. Omit for couch mode.  |
 | `server`  | WebSocket URL of the server (default: same host, port 8787 in dev). |
 | `seed`    | Arena seed for couch mode, any string.                    |
+| `netsim`  | `delay,jitter` in ms: artificial latency for testing online play. |
 
 ## Development
 

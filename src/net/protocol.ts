@@ -22,7 +22,8 @@ export type ServerMsg =
   | { t: 'welcome'; room: string; v: number }
   | { t: 'joined'; slot: string; id: number }
   /** Full state plus, per player id, the last input seq applied before this tick. */
-  | { t: 'snapshot'; state: GameState; acks: Record<string, number> }
+  /** `bufs`: inputs still queued on the server per player, for the client's clock control. */
+  | { t: 'snapshot'; state: GameState; acks: Record<string, number>; bufs: Record<string, number> }
   | DeltaMsg
   | { t: 'pong'; sent: number }
   | { t: 'error'; message: string };

@@ -2,7 +2,7 @@ import { applyDelta, type DeltaMsg } from '../net/delta.js';
 import { extrapolateState } from '../net/extrapolate.js';
 import { PROTOCOL_VERSION, decode, encode, type ClientMsg, type ServerMsg } from '../net/protocol.js';
 import { Room } from '../net/room.js';
-import { KNIFE_FLY_RADIUS, KNIFE_RECATCH_DELAY, PLAYER_RADIUS, TICK_RATE } from '../sim/constants.js';
+import { KNIFE_FLY_RADIUS, KNIFE_RECATCH_DELAY, PLAYER_RADIUS, SNAPSHOT_EVERY_TICKS, TICK_RATE } from '../sim/constants.js';
 import { lerp, lerpAngle } from '../sim/geom.js';
 import { getArena } from '../sim/arena.js';
 import { createThrow, flyKnife, predictLocalPlayer, separateBodies, touchesGroundKnife } from '../sim/sim.js';
@@ -24,6 +24,15 @@ export interface Frame {
 
 export interface NetStats {
   rttMs: number;
+  /** Arrival jitter of snapshots over the last ~2 s, ms. */
+  jitterMs: number;
+  /** Inputs the server had buffered for us at the last snapshot, and the target the clock control aims for. */
+  buffered: number;
+  targetBuffer: number;
+  /** Current tick clock rate (1 = nominal); above 1 means we are catching up. */
+  clockRate: number;
+  /** Ticks the remote view is rendered behind the estimated server tick. */
+  interpDelayTicks: number;
   /** Deltas that referenced a baseline we no longer had (should stay 0). */
   deltaMisses: number;
   /** Ticks the remote view is currently extrapolated ahead of the newest snapshot. */
@@ -173,17 +182,63 @@ function sessionId(): string {
   }
 }
 
-/** Render remote players this many ticks behind the estimated server tick. */
-const INTERP_DELAY_TICKS = 7; // ~117 ms: two snapshot intervals plus jitter margin
+/**
+ * Remote view timing. The render clock sits behind the estimated server
+ * tick by one snapshot interval plus measured jitter plus a margin, so there
+ * is almost always a newer snapshot to interpolate towards; it adapts to
+ * the connection instead of assuming a fixed 117 ms.
+ */
+const MIN_INTERP_DELAY_TICKS = 5;
+const MAX_INTERP_DELAY_TICKS = 18; // 300 ms
+const SNAPSHOT_INTERVAL_MS = SNAPSHOT_EVERY_TICKS * (1000 / TICK_RATE);
+/** Snapshot arrival samples kept for clock and jitter estimation (~2 s at 20 Hz). */
+const TIMING_WINDOW = 40;
+/** Input buffer target on the server, in ticks, bounds. */
+const MIN_TARGET_BUFFER = 2;
+const MAX_TARGET_BUFFER = 8; // 133 ms of input latency at most
+/** Tick clock rate bounds for the buffer control loop (time dilation). */
+const MIN_CLOCK_RATE = 0.9;
+const MAX_CLOCK_RATE = 1.1;
 /** How fast reconciliation errors are smoothed out (fraction per second). */
 const ERROR_DECAY_PER_S = 18;
 /** Corrections larger than this snap instead of smoothing. */
 const SNAP_DISTANCE = 120;
 
+/** Artificial latency for testing: every message is delayed by `delayMs` ± `jitterMs`, order preserved (like TCP). */
+export interface NetSim {
+  delayMs: number;
+  jitterMs: number;
+  /** Benchmark knob: disable the input-buffer clock control (fixed 60 Hz tick clock). */
+  noClockControl?: boolean;
+}
+
+/** FIFO delayed delivery: one timer chain, so entries never overtake each other. */
+class DelayQueue {
+  private readonly items: Array<{ at: number; fn: () => void }> = [];
+  private lastAt = 0;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+
+  push(at: number, fn: () => void): void {
+    const when = Math.max(at, this.lastAt);
+    this.lastAt = when;
+    this.items.push({ at: when, fn });
+    if (!this.timer) this.pump();
+  }
+
+  private pump(): void {
+    this.timer = null;
+    const now = performance.now();
+    while (this.items.length && this.items[0]!.at <= now) this.items.shift()!.fn();
+    if (this.items.length) this.timer = setTimeout(() => this.pump(), Math.max(1, this.items[0]!.at - now));
+  }
+}
+
 export class NetHost implements Host {
   readonly kind = 'net' as const;
   status = 'connecting';
   onJoined: Host['onJoined'] = null;
+  private readonly simOut = new DelayQueue();
+  private readonly simIn = new DelayQueue();
 
   private ws: WebSocket | null = null;
   private readonly snapshots: Snapshot[] = [];
@@ -205,18 +260,51 @@ export class NetHost implements Host {
   private acc = 0;
   private last = -1;
   private lastFrameAt = -1;
-  /** Estimated `localTime - serverTick * TICK_MS`, smoothed. */
-  private tickOffset: number | null = null;
+  /**
+   * Snapshot arrival timing: samples of `localTime - serverTick * TICK_MS`.
+   * The minimum over the window is the offset of the fastest packets (the
+   * true clock relation); the spread above it is jitter.
+   */
+  private readonly offsetSamples: number[] = [];
+  /** Local time at which the remote view's tick 0 "happens", smoothed by rate not by jumps. */
+  private renderOffset: number | null = null;
+  private renderOffsetAt = 0;
+  /** Server input buffer depth for our players, smoothed. */
+  private bufferDepth: number | null = null;
+  /** Tick clock rate: >1 runs ticks faster to refill the server buffer, <1 to drain it. */
+  private clockRate = 1;
+  /** Snapshots handled before this time arrived late because *we* stalled, not the network. */
+  private stallUntil = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private lastPingAt = 0;
   private closed = false;
-  private readonly netStats: NetStats = { rttMs: 0, deltaMisses: 0, extrapolated: 0, unacked: 0, lastCorrection: 0 };
+  private readonly netStats: NetStats = {
+    rttMs: 0,
+    jitterMs: 0,
+    buffered: 0,
+    targetBuffer: 2,
+    clockRate: 1,
+    interpDelayTicks: MIN_INTERP_DELAY_TICKS,
+    deltaMisses: 0,
+    extrapolated: 0,
+    unacked: 0,
+    lastCorrection: 0,
+  };
 
   constructor(
     private readonly url: string,
     private readonly room: string,
+    private readonly netsim: NetSim | null = null,
   ) {
     this.connect();
+  }
+
+  /** Delay a callback per the network simulator, never reordering (TCP semantics). */
+  private simulate(direction: 'in' | 'out', fn: () => void): void {
+    const sim = this.netsim;
+    if (!sim) return fn();
+    const at = performance.now() + sim.delayMs + (Math.random() * 2 - 1) * sim.jitterMs;
+    (direction === 'in' ? this.simIn : this.simOut).push(at, fn);
   }
 
   private connect(): void {
@@ -232,11 +320,17 @@ export class NetHost implements Host {
         this.send({ t: 'join', slot, name: s.name, color: s.color });
       }
       this.local.clear();
-      this.tickOffset = null;
+      this.offsetSamples.length = 0;
+      this.renderOffset = null;
+      this.bufferDepth = null;
+      this.clockRate = 1;
     };
     ws.onmessage = (ev) => {
-      const msg = decode<ServerMsg>(String(ev.data));
-      if (msg) this.handle(msg);
+      const raw = String(ev.data);
+      this.simulate('in', () => {
+        const msg = decode<ServerMsg>(raw);
+        if (msg) this.handle(msg);
+      });
     };
     ws.onclose = (ev) => {
       this.snapshots.length = 0;
@@ -255,7 +349,10 @@ export class NetHost implements Host {
   }
 
   private send(msg: ClientMsg): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(encode(msg));
+    const raw = encode(msg);
+    this.simulate('out', () => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(raw);
+    });
   }
 
   private handle(msg: ServerMsg): void {
@@ -280,7 +377,7 @@ export class NetHost implements Host {
         break;
       }
       case 'snapshot':
-        this.onSnapshot(msg.state, msg.acks);
+        this.onSnapshot(msg.state, msg.acks, msg.bufs);
         this.send({ t: 'ack', tick: msg.state.tick });
         break;
       case 'delta':
@@ -306,22 +403,27 @@ export class NetHost implements Host {
       return;
     }
     const state = applyDelta(base.state, d);
-    this.onSnapshot(state, d.acks);
+    this.onSnapshot(state, d.acks, d.bufs);
     this.send({ t: 'ack', tick: state.tick });
   }
 
-  private onSnapshot(state: GameState, acks: Record<string, number>): void {
+  private onSnapshot(state: GameState, acks: Record<string, number>, bufs: Record<string, number>): void {
     const at = performance.now();
     // The wire strips prevInput; give every player a valid one.
     for (const p of state.players) p.prevInput = copyInput(EMPTY_INPUT);
     this.pendingEvents.push(...state.events);
     state.events = [];
     this.snapshots.push({ state, tick: state.tick, at });
-    while (this.snapshots.length > 16) this.snapshots.shift();
+    while (this.snapshots.length > 32) this.snapshots.shift();
 
-    // Server tick timeline: local time at which server tick 0 "happened".
-    const off = at - state.tick * TICK_MS;
-    this.tickOffset = this.tickOffset === null ? off : this.tickOffset + (off - this.tickOffset) * 0.1;
+    // If our frame loop has not run for a while, this snapshot was delayed by
+    // us (GC, hidden tab), not by the network: keep it out of the jitter estimate.
+    const stalled = this.last >= 0 && at - this.last > 60;
+    if (!stalled && at >= this.stallUntil) {
+      this.offsetSamples.push(at - state.tick * TICK_MS);
+      while (this.offsetSamples.length > TIMING_WINDOW) this.offsetSamples.shift();
+    }
+    this.controlClock(bufs);
 
     const k = state.knife;
     if (k.mode === 'held') this.knifeLocal = this.local.has(k.holder);
@@ -432,11 +534,17 @@ export class NetHost implements Host {
 
   update(nowMs: number): void {
     if (this.last < 0) this.last = nowMs;
-    this.acc += Math.min(250, nowMs - this.last);
+    // A stalled frame (tab hidden, GC) must not burst a pile of ticks at the
+    // server; anything beyond 100 ms is simply lost time. Messages that piled
+    // up during the stall are not evidence of network jitter either.
+    const dt = nowMs - this.last;
+    if (dt > 60) this.stallUntil = performance.now() + 50;
+    this.acc += Math.min(100, dt);
     this.last = nowMs;
     const latest = this.snapshots[this.snapshots.length - 1]?.state ?? null;
-    while (this.acc >= TICK_MS) {
-      this.acc -= TICK_MS;
+    const tickMs = TICK_MS / this.clockRate;
+    while (this.acc >= tickMs) {
+      this.acc -= tickMs;
       this.clientTick++;
       if (this.local.size === 0) continue;
       const batch: Array<{ id: number; input: PlayerInput }> = [];
@@ -563,16 +671,74 @@ export class NetHost implements Host {
     return { state: { ...base, players, knife }, events };
   }
 
-  /** Server tick the remote view is rendered at (fractional). */
+  /** Fastest-packet clock offset and jitter (90th percentile above the minimum) over the window. */
+  private timing(): { offset: number; jitterMs: number } | null {
+    const n = this.offsetSamples.length;
+    if (n === 0) return null;
+    const sorted = this.offsetSamples.slice().sort((a, b) => a - b);
+    const offset = sorted[0]!;
+    const p90 = sorted[Math.min(n - 1, Math.floor(n * 0.9))]!;
+    return { offset, jitterMs: p90 - offset };
+  }
+
+  /**
+   * Time dilation (the Overwatch approach): the server reports how many of
+   * our inputs it still has queued; we run our tick clock a little faster
+   * when the buffer is below target and slower when above, so it hovers at
+   * a depth that covers the measured jitter and never runs dry (which would
+   * make the server repeat an input and cause a correction).
+   */
+  private controlClock(bufs: Record<string, number>): void {
+    let depth: number | null = null;
+    for (const id of this.local.keys()) {
+      const b = bufs[String(id)];
+      if (b !== undefined) depth = depth === null ? b : Math.min(depth, b);
+    }
+    const t = this.timing();
+    const jitterTicks = t ? Math.ceil(t.jitterMs / TICK_MS) : 0;
+    const target = Math.max(MIN_TARGET_BUFFER, Math.min(MAX_TARGET_BUFFER, jitterTicks + 1));
+    this.netStats.targetBuffer = target;
+    this.netStats.jitterMs = t?.jitterMs ?? 0;
+    if (depth === null) return;
+    this.bufferDepth = this.bufferDepth === null ? depth : this.bufferDepth + (depth - this.bufferDepth) * 0.25;
+    this.netStats.buffered = depth;
+    const error = target - this.bufferDepth;
+    if (this.netsim?.noClockControl) return;
+    this.clockRate = Math.max(MIN_CLOCK_RATE, Math.min(MAX_CLOCK_RATE, 1 + error * 0.02));
+    this.netStats.clockRate = this.clockRate;
+  }
+
+  /**
+   * Server tick the remote view is rendered at (fractional). The underlying
+   * clock only moves by rate (up to 2 % of real time, 20 % when far off) so a
+   * burst of late packets slews the view instead of jumping it.
+   */
   private renderTick(): number {
-    if (this.tickOffset === null) return 0;
-    return (performance.now() - this.tickOffset) / TICK_MS - INTERP_DELAY_TICKS;
+    const t = this.timing();
+    if (!t) return 0;
+    const now = performance.now();
+    const delayTicks = Math.max(
+      MIN_INTERP_DELAY_TICKS,
+      Math.min(MAX_INTERP_DELAY_TICKS, Math.ceil((SNAPSHOT_INTERVAL_MS + t.jitterMs) / TICK_MS) + 1),
+    );
+    this.netStats.interpDelayTicks = delayTicks;
+    const target = t.offset + delayTicks * TICK_MS;
+    if (this.renderOffset === null) {
+      this.renderOffset = target;
+    } else {
+      const elapsed = Math.max(0, now - this.renderOffsetAt);
+      const diff = target - this.renderOffset;
+      const maxStep = elapsed * (Math.abs(diff) > 150 ? 0.2 : 0.02);
+      this.renderOffset += Math.max(-maxStep, Math.min(maxStep, diff));
+    }
+    this.renderOffsetAt = now;
+    return (now - this.renderOffset) / TICK_MS;
   }
 
   /** Remote view of the world at the render tick, interpolated by server tick. */
   private interpolated(): GameState | null {
     const n = this.snapshots.length;
-    if (n === 0 || this.tickOffset === null) return null;
+    if (n === 0 || this.offsetSamples.length === 0) return null;
     const newest = this.snapshots[n - 1]!;
     const renderTick = this.renderTick();
     if (renderTick >= newest.tick) {

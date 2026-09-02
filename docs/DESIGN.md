@@ -57,10 +57,28 @@ src/client   Phaser 4: input slots, host abstraction, renderer, HUD
   a local player is shown advanced to the present rather than 117 ms behind,
   so it lines up with the predicted thrower; remote throws stay on the
   interpolated timeline, which matches the remote players they interact with.
+- Clock control (time dilation, the Overwatch approach). Every snapshot
+  reports how many of the client's inputs the server still has queued. The
+  client runs its 60 Hz tick clock up to 10 % faster or slower to hold that
+  depth at a target of measured jitter plus one tick (2 to 8 ticks). A
+  buffer that runs dry makes the server repeat the last input, which is a
+  guaranteed correction; a buffer that is too deep is pure input latency.
+  The server-side queue cap is 30 inputs (500 ms). A stalled frame is capped
+  at 100 ms of catch-up so the client never bursts a pile of ticks, and
+  snapshots that piled up during a local stall are excluded from the jitter
+  estimate.
 - Remote players and the flying knife are interpolated between snapshots on
-  a server-tick timeline: the client estimates the offset between local time
-  and server ticks from snapshot arrival times (smoothed) and renders 7 ticks
-  (~117 ms) behind, so network jitter does not translate into stutter.
+  a server-tick timeline. The clock relation is taken from the *fastest*
+  snapshots in a 2 s window (the minimum of arrival time minus tick time),
+  so a burst of late packets does not drag the timeline; jitter is the 90th
+  percentile above that minimum. The render delay is one snapshot interval
+  plus jitter plus one tick (5 to 18 ticks, 83 to 300 ms), adapting to the
+  connection, and the render clock only slews by rate (2 % of real time, 20 %
+  when far off) instead of jumping. The HUD shows jitter, buffer depth versus
+  target, clock rate and interpolation delay.
+- `?netsim=delay,jitter` (ms) adds order-preserving artificial latency to
+  the client for testing; the bench harness in the scratchpad measures
+  correction sizes under lag, jitter and frame stalls.
 - Mixed couch + online: every client can register several local players
   (one per control slot). Ownership is per *session* (a random id kept in
   the tab's `sessionStorage`), not per socket: a reconnect with the same
@@ -119,7 +137,10 @@ on the ground it has a soft shadow so its blocking footprint is visible.
 - Sounds, a proper lobby with name/colour selection, scoreboards across
   rounds, spectators.
 - Bots to fill rooms.
-- Delta-compressed or binary snapshots (currently full JSON state at 20 Hz,
-  roughly 200 bytes per player; fine for 32 players on a LAN or a decent
-  connection).
+- Binary snapshot encoding (deltas are still JSON).
+- WebRTC unreliable data channels instead of WebSocket/TCP. Over lossy wifi
+  a single lost packet stalls every later message until it is retransmitted
+  (head-of-line blocking); UDP-style transport with redundant input packets
+  is what Overwatch and most shooters use, and it is the remaining structural
+  difference.
 - Binary snapshot encoding (deltas are still JSON).

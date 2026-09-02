@@ -57,6 +57,7 @@ interface Session {
 
 interface RoomStats {
   bytesOut: number;
+  inputsIn: number;
   snapshots: number;
   deltas: number;
   overruns: number;
@@ -83,7 +84,7 @@ function send(c: Client, msg: ServerMsg): void {
 
 /** A copy of the state as it goes on the wire (server-only fields removed). */
 function wireCopy(state: GameState): GameState {
-  return JSON.parse(encode({ t: 'snapshot', state, acks: {} })).state as GameState;
+  return JSON.parse(encode({ t: 'snapshot', state, acks: {}, bufs: {} })).state as GameState;
 }
 
 /**
@@ -94,6 +95,7 @@ function broadcastState(entry: RoomEntry): void {
   const room = entry.room;
   const cur = wireCopy(room.state);
   const acks = room.ackRecord();
+  const bufs = room.bufRecord();
   const tick = room.state.tick;
   let full: string | null = null;
   for (const c of entry.clients) {
@@ -101,10 +103,10 @@ function broadcastState(entry: RoomEntry): void {
     const base = entry.sent.get(c.ackedTick);
     let raw: string;
     if (base) {
-      raw = JSON.stringify(encodeDelta(base, cur, acks));
+      raw = JSON.stringify(encodeDelta(base, cur, acks, bufs));
       entry.stats.deltas++;
     } else {
-      full ??= encode({ t: 'snapshot', state: cur, acks });
+      full ??= encode({ t: 'snapshot', state: cur, acks, bufs });
       raw = full;
       entry.stats.snapshots++;
     }
@@ -125,9 +127,10 @@ function logStats(name: string, entry: RoomEntry): void {
     `[room ${name}] tick ${entry.room.state.tick} ${entry.room.state.phase} players ${entry.room.playerCount} ` +
       `sessions ${entry.sessions.size} sockets ${entry.clients.size} ` +
       `out ${(st.bytesOut / secs / 1024).toFixed(1)} kB/s (${st.deltas} delta, ${st.snapshots} full) ` +
+      `in ${(st.inputsIn / secs / Math.max(1, entry.room.playerCount)).toFixed(1)} inputs/s/player ` +
       `overruns ${st.overruns} queues [${queues}]`,
   );
-  entry.stats = { bytesOut: 0, snapshots: 0, deltas: 0, overruns: 0, loggedAt: now };
+  entry.stats = { bytesOut: 0, inputsIn: 0, snapshots: 0, deltas: 0, overruns: 0, loggedAt: now };
 }
 
 function getRoom(name: string): RoomEntry {
@@ -142,7 +145,7 @@ function getRoom(name: string): RoomEntry {
     accumulator: 0,
     last: performance.now(),
     sent: new Map(),
-    stats: { bytesOut: 0, snapshots: 0, deltas: 0, overruns: 0, loggedAt: Date.now() },
+    stats: { bytesOut: 0, inputsIn: 0, snapshots: 0, deltas: 0, overruns: 0, loggedAt: Date.now() },
     timer: setInterval(() => {
       const now = performance.now();
       created.accumulator += now - created.last;
@@ -242,7 +245,7 @@ function handle(c: Client, msg: ClientMsg): void {
       c.session = session;
       send(c, { t: 'welcome', room: name, v: PROTOCOL_VERSION });
       for (const [slot, id] of session.players) send(c, { t: 'joined', slot, id });
-      send(c, { t: 'snapshot', state: entry.room.state, acks: entry.room.ackRecord() });
+      send(c, { t: 'snapshot', state: entry.room.state, acks: entry.room.ackRecord(), bufs: entry.room.bufRecord() });
       break;
     }
     case 'join': {
@@ -284,6 +287,7 @@ function handle(c: Client, msg: ClientMsg): void {
         const clean = { fwd: !!input.fwd, back: !!input.back, left: !!input.left, right: !!input.right, throw: !!input.throw };
         if (clean.fwd || clean.back || clean.left || clean.right || clean.throw) c.session.lastActiveAt = Date.now();
         entry.room.pushInput(id, seq, clean, view);
+        entry.stats.inputsIn++;
       }
       break;
     }

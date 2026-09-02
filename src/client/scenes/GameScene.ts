@@ -5,7 +5,7 @@ import { ARENA_H, ARENA_W, MAX_PLAYERS, TICK_RATE } from '../../sim/constants.js
 import { hashString } from '../../sim/rng.js';
 import { findPlayer, runnerSpeedMultiplier } from '../../sim/sim.js';
 import type { GameEvent, GameState } from '../../sim/types.js';
-import { LocalHost, NetHost, type Host } from '../host.js';
+import { LocalHost, NetHost, type Host, type NetSim } from '../host.js';
 import { LocalControls } from '../input.js';
 import { Renderer } from '../render.js';
 
@@ -24,6 +24,8 @@ interface Options {
   room: string | null;
   server: string;
   seed: number;
+  /** `?netsim=delay,jitter` in ms adds artificial latency for testing. */
+  netsim: NetSim | null;
 }
 
 function readOptions(): Options {
@@ -35,10 +37,13 @@ function readOptions(): Options {
       ? `${proto}://${location.hostname}:${DEFAULT_PORT}`
       : `${proto}://${location.host}`;
   const seedStr = q.get('seed');
+  const sim = q.get('netsim');
+  const [d, j] = sim ? sim.split(',').map(Number) : [];
   return {
     room,
     server: q.get('server') ?? defaultServer,
     seed: seedStr ? hashString(seedStr) : (Date.now() >>> 0),
+    netsim: d !== undefined && Number.isFinite(d) ? { delayMs: d, jitterMs: Number.isFinite(j) ? j! : 0 } : null,
   };
 }
 
@@ -60,7 +65,7 @@ export class GameScene extends Phaser.Scene {
 
   create(): void {
     const opts = readOptions();
-    this.host = opts.room ? new NetHost(opts.server, opts.room) : new LocalHost(opts.seed);
+    this.host = opts.room ? new NetHost(opts.server, opts.room, opts.netsim) : new LocalHost(opts.seed);
     this.host.onJoined = (slot, id) => {
       this.slotToId.set(slot, id);
       this.pendingSlots.delete(slot);
@@ -126,7 +131,8 @@ export class GameScene extends Phaser.Scene {
     const mul = runnerSpeedMultiplier(state);
     const st = this.host.stats();
     const rtt = st
-      ? ` · rtt ${Math.round(st.rttMs)} ms · unacked ${st.unacked} · corr ${st.lastCorrection.toFixed(1)} px` +
+      ? ` · rtt ${Math.round(st.rttMs)} ms · jitter ${Math.round(st.jitterMs)} ms · buf ${st.buffered}/${st.targetBuffer}` +
+        ` · clock ×${st.clockRate.toFixed(2)} · delay ${st.interpDelayTicks}t · unacked ${st.unacked} · corr ${st.lastCorrection.toFixed(1)} px` +
         (st.extrapolated ? ` · extrapolating ${st.extrapolated}` : '') +
         (st.deltaMisses ? ` · delta misses ${st.deltaMisses}` : '')
       : '';

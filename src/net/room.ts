@@ -1,8 +1,8 @@
 import { addPlayer, createState, dropKnife, findPlayer, removePlayer, step } from '../sim/sim.js';
 import { EMPTY_INPUT, copyInput, type GameEvent, type GameState, type PlayerInput, type Vec } from '../sim/types.js';
 
-/** Inputs buffered ahead of the simulation; beyond this the oldest are dropped. */
-const MAX_QUEUE = 8;
+/** Inputs buffered ahead of the simulation (500 ms); beyond this the oldest are dropped. The client's clock control keeps the depth near a small jitter-derived target. */
+export const MAX_QUEUE = 30;
 /** Position history kept for lag compensation, in ticks. */
 const HISTORY_TICKS = 64;
 /** Never rewind a target further back than this (500 ms). */
@@ -140,6 +140,12 @@ export class Room {
     const ev = this.state.events;
     this.state.events = [];
     return ev;
+  }
+
+  bufRecord(): Record<string, number> {
+    const r: Record<string, number> = {};
+    for (const [id, q] of this.queues) r[id] = q.length;
+    return r;
   }
 
   ackRecord(): Record<string, number> {

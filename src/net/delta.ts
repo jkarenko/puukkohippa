@@ -15,13 +15,14 @@ export interface DeltaMsg {
   knife?: KnifeState;
   events?: GameEvent[];
   acks: Record<string, number>;
+  bufs: Record<string, number>;
 }
 
 const TOP_KEYS = ['phase', 'phaseEndsTick', 'round', 'seed', 'conversions', 'lastCaught', 'roundStartTick', 'nextPlayerId'] as const;
 const PLAYER_KEYS = ['name', 'color', 'x', 'y', 'heading', 'role', 'moveSpeed', 'charge', 'caughtTick', 'catches', 'wins', 'connected'] as const;
 
-export function encodeDelta(base: GameState, cur: GameState, acks: Record<string, number>): DeltaMsg {
-  const d: DeltaMsg = { t: 'delta', base: base.tick, tick: cur.tick, acks };
+export function encodeDelta(base: GameState, cur: GameState, acks: Record<string, number>, bufs: Record<string, number> = {}): DeltaMsg {
+  const d: DeltaMsg = { t: 'delta', base: base.tick, tick: cur.tick, acks, bufs };
   const top: Record<string, unknown> = {};
   for (const k of TOP_KEYS) if (base[k] !== cur[k]) top[k] = cur[k];
   if (Object.keys(top).length) d.top = top as DeltaMsg['top'];

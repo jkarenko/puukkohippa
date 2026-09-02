@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { decode, encode, normalizeRoomName } from '../src/net/protocol.js';
-import { Room } from '../src/net/room.js';
+import { MAX_QUEUE, Room } from '../src/net/room.js';
 import { getArena } from '../src/sim/arena.js';
 import { COUNTDOWN_TIME, KNIFE_FLY_RADIUS, KNIFE_RECATCH_DELAY, PLAYER_RADIUS, TICK_RATE } from '../src/sim/constants.js';
 import { createThrow, flyKnife, predictLocalPlayer, separateBodies } from '../src/sim/sim.js';
@@ -12,7 +12,7 @@ function inp(partial: Partial<PlayerInput> = {}): PlayerInput {
 
 /** Deep copy the way the wire does it (JSON, prevInput stripped and restored). */
 function overWire(state: GameState): GameState {
-  const s = decode<{ t: 'snapshot'; state: GameState }>(encode({ t: 'snapshot', state, acks: {} }))!.state;
+  const s = decode<{ t: 'snapshot'; state: GameState }>(encode({ t: 'snapshot', state, acks: {}, bufs: {} }))!.state;
   for (const p of s.players) p.prevInput = copyInput(EMPTY_INPUT);
   return s;
 }
@@ -43,16 +43,17 @@ describe('Room input queue', () => {
     room.pushInput(id, 5, inp());
     room.pushInput(id, 4, inp());
     expect(room.queued(id)).toBe(1);
-    for (let s = 6; s < 40; s++) room.pushInput(id, s, inp());
-    expect(room.queued(id)).toBeLessThanOrEqual(8);
+    for (let s = 6; s < 6 + MAX_QUEUE + 10; s++) room.pushInput(id, s, inp());
+    expect(room.queued(id)).toBe(MAX_QUEUE);
     room.tick();
-    expect(room.acks.get(id)!).toBeGreaterThan(30);
+    // The oldest were dropped: the first applied seq is the last one minus the cap.
+    expect(room.acks.get(id)).toBe(6 + MAX_QUEUE + 10 - 1 - MAX_QUEUE + 1);
   });
 
   it('strips prevInput from the wire', () => {
     const room = new Room(1);
     room.addPlayer('A', 1);
-    const raw = encode({ t: 'snapshot', state: room.state, acks: room.ackRecord() });
+    const raw = encode({ t: 'snapshot', state: room.state, acks: room.ackRecord(), bufs: room.bufRecord() });
     expect(raw).not.toContain('prevInput');
   });
 });

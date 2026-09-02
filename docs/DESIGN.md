@@ -8,7 +8,7 @@
 | A puukottaja touching a runner converts them. | `playerInteractions` in `src/sim/sim.ts` |
 | Every puukottaja has a built-in knife (touch works without the puukko). | Touch conversion does not depend on the knife. |
 | Exactly one throwable puukko exists at all times. | `GameState.knife` is a single state machine: `held`, `flying`, `ground`. |
-| The carrier moves at 90 % of runner speed. | `speedFor`; `KNIFE_CARRIER_SPEED_FACTOR`. |
+| The carrier moves at 90 % of the runners' *base* speed; the per-conversion runner bonus does not apply to the carrier. | `speedFor`; `KNIFE_CARRIER_SPEED_FACTOR`. |
 | Hold throw to charge, release to throw straight ahead. Longer charge = faster and farther. | `updateThrowing`; speed is `lerp(THROW_SPEED_MIN, THROW_SPEED_MAX, charge)`; the knife decelerates at `KNIFE_DECEL`, so range grows quadratically with speed. |
 | Tap a direction while charging to pass to the nearest puukottaja in that direction (heading-relative 4 sectors; fall back to the puukottaja angularly closest to the sector). | `pickPassTarget` in `src/sim/targeting.ts`. A *newly pressed* direction key triggers the pass; keys that were already held when charging began keep moving the player. |
 | A flying knife converts the runner it hits; the runner then holds the knife. | `updateKnife`. The thrower cannot re-catch for `KNIFE_RECATCH_DELAY`. |

@@ -66,7 +66,8 @@ export function speedFor(state: GameState, p: PlayerState): number {
   const runnerSpeed = BASE_SPEED * runnerSpeedMultiplier(state);
   if (p.role === 'runner') return runnerSpeed;
   if (state.knife.mode === 'held' && state.knife.holder === p.id) {
-    return runnerSpeed * KNIFE_CARRIER_SPEED_FACTOR;
+    // Relative to the runners' original speed, not their boosted speed.
+    return BASE_SPEED * KNIFE_CARRIER_SPEED_FACTOR;
   }
   return BASE_SPEED;
 }

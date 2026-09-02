@@ -19,7 +19,7 @@ export const PLAYER_RADIUS = 14;
 export const BASE_SPEED = 240;
 export const TURN_RATE = 3.8; // rad/s
 
-/** The knife carrier moves at this fraction of the runners' speed. */
+/** The knife carrier moves at this fraction of the runners' base speed (before conversion bonuses). */
 export const KNIFE_CARRIER_SPEED_FACTOR = 0.9;
 /** Runners get this much faster (multiplicative bonus) per conversion in a round. */
 export const RUNNER_SPEED_BONUS_PER_CONVERSION = 0.06;

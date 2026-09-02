@@ -87,9 +87,10 @@ describe('speeds', () => {
     expect(speedFor(ctx.state, ctx.it)).toBeCloseTo(BASE_SPEED * KNIFE_CARRIER_SPEED_FACTOR);
   });
 
-  it('runners speed up after a conversion', () => {
+  it('runners speed up after a conversion, the carrier does not', () => {
     ctx.state.conversions = 1;
     expect(speedFor(ctx.state, ctx.runner)).toBeCloseTo(BASE_SPEED * (1 + RUNNER_SPEED_BONUS_PER_CONVERSION));
+    expect(speedFor(ctx.state, ctx.it)).toBeCloseTo(BASE_SPEED * KNIFE_CARRIER_SPEED_FACTOR);
   });
 });
 

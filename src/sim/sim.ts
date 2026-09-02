@@ -36,6 +36,7 @@ import {
   type PlayerInput,
   type PlayerState,
   type ThrowIntent,
+  type Vec,
 } from './types.js';
 
 const DIRS: Dir[] = ['fwd', 'back', 'left', 'right'];
@@ -222,7 +223,7 @@ function land(state: GameState, x: number, y: number, heading: number): void {
   state.events.push({ type: 'knifeLanded' });
 }
 
-function resolveObstacles(arena: Arena, p: { x: number; y: number }, r: number): void {
+export function resolveObstacles(arena: Arena, p: { x: number; y: number }, r: number): void {
   // Two passes so corner overlaps settle.
   for (let pass = 0; pass < 2; pass++) {
     let any = false;
@@ -339,13 +340,14 @@ export function flyKnife(arena: Arena, k: FlyingKnife, onSubstep: ((k: FlyingKni
   return k;
 }
 
-function updateKnife(state: GameState, arena: Arena): void {
+function updateKnife(state: GameState, arena: Arena, rewind: StepOptions['rewind'] | null): void {
   const k = state.knife;
   if (k.mode !== 'flying') return;
   let caught = false;
   const result = flyKnife(arena, k, (fk) => {
     for (const p of state.players) {
-      if (Math.hypot(p.x - fk.x, p.y - fk.y) >= PLAYER_RADIUS + KNIFE_FLY_RADIUS) continue;
+      const seen = (rewind && p.id !== fk.thrower && rewind(fk.thrower, p.id)) || p;
+      if (Math.hypot(seen.x - fk.x, seen.y - fk.y) >= PLAYER_RADIUS + KNIFE_FLY_RADIUS) continue;
       if (p.id === fk.thrower && fk.airTime < KNIFE_RECATCH_DELAY) continue;
       if (p.role === 'runner') {
         const by = findPlayer(state, fk.thrower) ?? p;
@@ -400,9 +402,25 @@ function groundKnifeInteractions(state: GameState): void {
   }
 }
 
-function playerInteractions(state: GameState, arena: Arena, interactive: boolean): void {
+function playerInteractions(
+  state: GameState,
+  arena: Arena,
+  interactive: boolean,
+  rewind: StepOptions['rewind'] | null,
+): void {
   const ps = state.players;
   const minD = PLAYER_RADIUS * 2;
+  if (interactive) {
+    // Touches are judged from the puukottaja's point of view (lag compensated).
+    for (const a of ps) {
+      if (a.role !== 'puukottaja') continue;
+      for (const b of ps) {
+        if (b.role !== 'runner') continue;
+        const seen = (rewind && rewind(a.id, b.id)) || b;
+        if (Math.hypot(seen.x - a.x, seen.y - a.y) < minD) convert(state, b, a, false);
+      }
+    }
+  }
   for (let i = 0; i < ps.length; i++) {
     for (let j = i + 1; j < ps.length; j++) {
       const a = ps[i]!;
@@ -411,10 +429,6 @@ function playerInteractions(state: GameState, arena: Arena, interactive: boolean
       const dy = b.y - a.y;
       const d = Math.hypot(dx, dy);
       if (d >= minD) continue;
-      if (interactive) {
-        if (a.role === 'puukottaja' && b.role === 'runner') convert(state, b, a, false);
-        else if (b.role === 'puukottaja' && a.role === 'runner') convert(state, a, b, false);
-      }
       // Separate overlapping bodies.
       const nx = d > 1e-6 ? dx / d : 1;
       const ny = d > 1e-6 ? dy / d : 0;
@@ -429,8 +443,18 @@ function playerInteractions(state: GameState, arena: Arena, interactive: boolean
   }
 }
 
+export interface StepOptions {
+  /**
+   * Lag compensation: where `viewer` currently sees `target`. Return null to
+   * use the live position. Only touch and knife-hit checks consult this.
+   */
+  rewind?: (viewerId: number, targetId: number) => Vec | null;
+}
+
+const NO_REWIND: StepOptions = {};
+
 /** Advance the simulation by one fixed tick. Inputs map player id -> input. */
-export function step(state: GameState, inputs: ReadonlyMap<number, PlayerInput>): void {
+export function step(state: GameState, inputs: ReadonlyMap<number, PlayerInput>, opts: StepOptions = NO_REWIND): void {
   state.tick++;
   const arena = getArena(state.seed);
 
@@ -466,11 +490,12 @@ export function step(state: GameState, inputs: ReadonlyMap<number, PlayerInput>)
     else p.charge = -1;
   }
 
+  const rewind = opts.rewind ?? null;
   if (interactive) {
-    updateKnife(state, arena);
+    updateKnife(state, arena, rewind);
     groundKnifeInteractions(state);
   }
-  playerInteractions(state, arena, interactive);
+  playerInteractions(state, arena, interactive, rewind);
 
   // Keep the knife holder consistent if the holder vanished.
   if (state.knife.mode === 'held' && !findPlayer(state, state.knife.holder)) {

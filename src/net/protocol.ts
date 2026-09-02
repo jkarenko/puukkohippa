@@ -1,15 +1,21 @@
 import type { GameState, PlayerInput } from '../sim/types.js';
+import type { DeltaMsg } from './delta.js';
 
 export const DEFAULT_PORT = 8787;
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 export type ClientMsg =
   /** `session` identifies this browser tab across reconnects. */
   | { t: 'hello'; room: string; v: number; session: string }
   | { t: 'join'; slot: string; name: string; color: number }
   | { t: 'leave'; id: number }
-  /** One client tick worth of inputs. `seq` is the client's tick counter. */
-  | { t: 'input'; seq: number; inputs: Array<{ id: number; input: PlayerInput }> }
+  /**
+   * One client tick worth of inputs. `seq` is the client's tick counter,
+   * `view` the server tick its remote view was rendered at (lag compensation).
+   */
+  | { t: 'input'; seq: number; view: number; inputs: Array<{ id: number; input: PlayerInput }> }
+  /** Last snapshot tick the client applied; the server sends deltas against it. */
+  | { t: 'ack'; tick: number }
   | { t: 'ping'; sent: number };
 
 export type ServerMsg =
@@ -17,6 +23,7 @@ export type ServerMsg =
   | { t: 'joined'; slot: string; id: number }
   /** Full state plus, per player id, the last input seq applied before this tick. */
   | { t: 'snapshot'; state: GameState; acks: Record<string, number> }
+  | DeltaMsg
   | { t: 'pong'; sent: number }
   | { t: 'error'; message: string };
 

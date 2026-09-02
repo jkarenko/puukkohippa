@@ -1,12 +1,23 @@
 import { addPlayer, createState, dropKnife, findPlayer, removePlayer, step } from '../sim/sim.js';
-import { EMPTY_INPUT, copyInput, type GameEvent, type GameState, type PlayerInput } from '../sim/types.js';
+import { EMPTY_INPUT, copyInput, type GameEvent, type GameState, type PlayerInput, type Vec } from '../sim/types.js';
 
 /** Inputs buffered ahead of the simulation; beyond this the oldest are dropped. */
 const MAX_QUEUE = 8;
+/** Position history kept for lag compensation, in ticks. */
+const HISTORY_TICKS = 64;
+/** Never rewind a target further back than this (500 ms). */
+export const MAX_REWIND_TICKS = 30;
 
 interface QueuedInput {
   seq: number;
   input: PlayerInput;
+  /** Server tick the sender's remote view was rendered at, if reported. */
+  view: number | null;
+}
+
+interface HistoryEntry {
+  tick: number;
+  pos: Map<number, Vec>;
 }
 
 /**
@@ -23,18 +34,26 @@ export class Room {
   readonly state: GameState;
   /** Last input seq applied for each player, for client reconciliation. */
   readonly acks = new Map<number, number>();
+  /** Which session owns each player; players of one session are never rewound against each other. */
+  readonly owners = new Map<number, string>();
   private readonly inputs = new Map<number, PlayerInput>();
   private readonly queues = new Map<number, QueuedInput[]>();
+  /** Latest reported view tick per player, updated when their input is applied. */
+  private readonly views = new Map<number, number>();
+  private readonly history: Array<HistoryEntry | undefined> = new Array(HISTORY_TICKS);
+  /** Lag compensation hook handed to the sim; see `rewind`. */
+  private readonly rewindHook = (viewer: number, target: number): Vec | null => this.rewind(viewer, target);
 
   constructor(seed: number) {
     this.state = createState(seed);
   }
 
-  addPlayer(name: string, color: number): number {
+  addPlayer(name: string, color: number, owner = ''): number {
     const p = addPlayer(this.state, name, color);
     this.inputs.set(p.id, copyInput(EMPTY_INPUT));
     this.queues.set(p.id, []);
     this.acks.set(p.id, 0);
+    if (owner) this.owners.set(p.id, owner);
     return p.id;
   }
 
@@ -43,6 +62,26 @@ export class Room {
     this.inputs.delete(id);
     this.queues.delete(id);
     this.acks.delete(id);
+    this.owners.delete(id);
+    this.views.delete(id);
+  }
+
+  /**
+   * Where `viewer` saw `target` when their latest applied input was made:
+   * the target's position `tick - view` ticks ago, capped at MAX_REWIND_TICKS.
+   * Null when there is nothing to compensate (same session, no view, no history).
+   */
+  rewind(viewer: number, target: number): Vec | null {
+    const view = this.views.get(viewer);
+    if (view === undefined) return null;
+    const ov = this.owners.get(viewer);
+    if (ov === undefined || ov === this.owners.get(target)) return null;
+    const delay = Math.min(MAX_REWIND_TICKS, this.state.tick - view);
+    if (delay <= 0) return null;
+    const at = this.state.tick - delay;
+    const entry = this.history[at % HISTORY_TICKS];
+    if (!entry || entry.tick !== at) return null;
+    return entry.pos.get(target) ?? null;
   }
 
   /**
@@ -67,12 +106,12 @@ export class Room {
   }
 
   /** Queue a sequenced input. Out-of-order or duplicate seqs are ignored. */
-  pushInput(id: number, seq: number, input: PlayerInput): void {
+  pushInput(id: number, seq: number, input: PlayerInput, view: number | null = null): void {
     const q = this.queues.get(id);
     if (!q || !findPlayer(this.state, id)?.connected) return;
     const last = q.length ? q[q.length - 1]!.seq : (this.acks.get(id) ?? 0);
     if (seq <= last) return;
-    q.push({ seq, input: copyInput(input) });
+    q.push({ seq, input: copyInput(input), view });
     if (q.length > MAX_QUEUE) q.splice(0, q.length - MAX_QUEUE);
   }
 
@@ -87,9 +126,13 @@ export class Room {
       if (next) {
         this.inputs.set(id, next.input);
         this.acks.set(id, next.seq);
+        if (next.view !== null) this.views.set(id, next.view);
       }
     }
-    step(this.state, this.inputs);
+    step(this.state, this.inputs, { rewind: this.rewindHook });
+    const pos = new Map<number, Vec>();
+    for (const p of this.state.players) pos.set(p.id, { x: p.x, y: p.y });
+    this.history[this.state.tick % HISTORY_TICKS] = { tick: this.state.tick, pos };
   }
 
   /** Returns and clears the events accumulated since the last flush. */

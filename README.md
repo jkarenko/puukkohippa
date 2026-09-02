@@ -34,7 +34,8 @@ pnpm server       # WebSocket server on ws://localhost:8787 (for online rooms)
 - Online play: run `pnpm server`, then open `http://localhost:5173/?room=sauna`
   on every machine. Your own players are predicted locally, so controls feel
   instant; other players are shown about 120 ms behind. If your connection
-  drops, your players wait 10 s for you to reconnect before they are removed. Each machine can still join several local players. Use
+  drops, your players wait 10 s for you to reconnect before they are removed.
+  `GET /stats` on the server shows rooms, players and input queue depths. Each machine can still join several local players. Use
   `&server=ws://host:8787` to point at a server on another machine.
 - Production: `pnpm build` then `pnpm start`. The Node server serves the built
   client and the WebSocket endpoint on the same port (`PORT`, default 8787).

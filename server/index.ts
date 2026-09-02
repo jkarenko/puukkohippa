@@ -2,10 +2,12 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { extname, join, normalize, resolve } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
+import { encodeDelta } from '../src/net/delta.js';
 import { DEFAULT_PORT, PROTOCOL_VERSION, decode, encode, type ClientMsg, type ServerMsg } from '../src/net/protocol.js';
 import { Room } from '../src/net/room.js';
 import { MAX_PLAYERS, SNAPSHOT_EVERY_TICKS, TICK_RATE } from '../src/sim/constants.js';
 import { hashString } from '../src/sim/rng.js';
+import type { GameState } from '../src/sim/types.js';
 
 const PORT = Number(process.env['PORT'] ?? DEFAULT_PORT);
 const DIST = resolve(process.cwd(), 'dist');
@@ -14,12 +16,29 @@ const DIST = resolve(process.cwd(), 'dist');
 const RECONNECT_GRACE_MS = 10_000;
 /** WebSocket heartbeat: ping interval; a socket that misses one is terminated. */
 const HEARTBEAT_MS = 5_000;
+/** Sessions that press nothing for this long are removed (lobby / in a round). */
+const IDLE_KICK_LOBBY_MS = 60_000;
+const IDLE_KICK_PLAYING_MS = 180_000;
+/** Sent snapshots kept as delta baselines, in ticks (3 s). */
+const SNAPSHOT_HISTORY_TICKS = 180;
+/** Caps. A LAN party behind one NAT shares an IP, so keep that one generous. */
+const MAX_PAYLOAD_BYTES = 4096;
+const MAX_CONNECTIONS_PER_IP = 32;
+const MAX_ROOMS = 64;
+const MAX_MESSAGES_PER_SEC = 150; // ~60 inputs + acks + pings, with headroom
+const STATS_LOG_MS = 10_000;
 
 interface Client {
   ws: WebSocket;
+  ip: string;
   room: string | null;
   session: Session | null;
   alive: boolean;
+  /** Last snapshot tick this client acknowledged; deltas are encoded against it. */
+  ackedTick: number;
+  /** Token bucket for message rate limiting. */
+  tokens: number;
+  tokensAt: number;
 }
 
 /**
@@ -32,6 +51,16 @@ interface Session {
   players: Map<string, number>;
   client: Client | null;
   disconnectedAt: number | null;
+  /** Last time any button was pressed (idle kick). */
+  lastActiveAt: number;
+}
+
+interface RoomStats {
+  bytesOut: number;
+  snapshots: number;
+  deltas: number;
+  overruns: number;
+  loggedAt: number;
 }
 
 interface RoomEntry {
@@ -41,6 +70,9 @@ interface RoomEntry {
   timer: NodeJS.Timeout;
   accumulator: number;
   last: number;
+  /** Wire copies of recent snapshots by tick, delta baselines. */
+  sent: Map<number, GameState>;
+  stats: RoomStats;
 }
 
 const rooms = new Map<string, RoomEntry>();
@@ -49,9 +81,53 @@ function send(c: Client, msg: ServerMsg): void {
   if (c.ws.readyState === WebSocket.OPEN) c.ws.send(encode(msg));
 }
 
-function broadcast(entry: RoomEntry, msg: ServerMsg): void {
-  const raw = encode(msg);
-  for (const c of entry.clients) if (c.ws.readyState === WebSocket.OPEN) c.ws.send(raw);
+/** A copy of the state as it goes on the wire (server-only fields removed). */
+function wireCopy(state: GameState): GameState {
+  return JSON.parse(encode({ t: 'snapshot', state, acks: {} })).state as GameState;
+}
+
+/**
+ * Send the current state to every client: a delta against the snapshot the
+ * client last acknowledged when we still have it, a full snapshot otherwise.
+ */
+function broadcastState(entry: RoomEntry): void {
+  const room = entry.room;
+  const cur = wireCopy(room.state);
+  const acks = room.ackRecord();
+  const tick = room.state.tick;
+  let full: string | null = null;
+  for (const c of entry.clients) {
+    if (c.ws.readyState !== WebSocket.OPEN) continue;
+    const base = entry.sent.get(c.ackedTick);
+    let raw: string;
+    if (base) {
+      raw = JSON.stringify(encodeDelta(base, cur, acks));
+      entry.stats.deltas++;
+    } else {
+      full ??= encode({ t: 'snapshot', state: cur, acks });
+      raw = full;
+      entry.stats.snapshots++;
+    }
+    entry.stats.bytesOut += raw.length;
+    c.ws.send(raw);
+  }
+  entry.sent.set(tick, cur);
+  for (const t of entry.sent.keys()) if (t < tick - SNAPSHOT_HISTORY_TICKS) entry.sent.delete(t);
+}
+
+function logStats(name: string, entry: RoomEntry): void {
+  const st = entry.stats;
+  const now = Date.now();
+  const secs = (now - st.loggedAt) / 1000;
+  if (secs < STATS_LOG_MS / 1000) return;
+  const queues = entry.room.state.players.map((p) => `${p.id}:${entry.room.queued(p.id)}`).join(' ');
+  console.log(
+    `[room ${name}] tick ${entry.room.state.tick} ${entry.room.state.phase} players ${entry.room.playerCount} ` +
+      `sessions ${entry.sessions.size} sockets ${entry.clients.size} ` +
+      `out ${(st.bytesOut / secs / 1024).toFixed(1)} kB/s (${st.deltas} delta, ${st.snapshots} full) ` +
+      `overruns ${st.overruns} queues [${queues}]`,
+  );
+  entry.stats = { bytesOut: 0, snapshots: 0, deltas: 0, overruns: 0, loggedAt: now };
 }
 
 function getRoom(name: string): RoomEntry {
@@ -65,22 +141,28 @@ function getRoom(name: string): RoomEntry {
     sessions: new Map(),
     accumulator: 0,
     last: performance.now(),
+    sent: new Map(),
+    stats: { bytesOut: 0, snapshots: 0, deltas: 0, overruns: 0, loggedAt: Date.now() },
     timer: setInterval(() => {
       const now = performance.now();
       created.accumulator += now - created.last;
       created.last = now;
       expireSessions(name, created);
       // Never spiral: cap catch-up at a quarter second.
-      if (created.accumulator > 250) created.accumulator = 250;
+      if (created.accumulator > 250) {
+        created.accumulator = 250;
+        created.stats.overruns++;
+      }
       while (created.accumulator >= tickMs) {
         created.accumulator -= tickMs;
         room.tick();
         if (room.state.tick % SNAPSHOT_EVERY_TICKS === 0) {
           // Events from all ticks since the last snapshot ride along.
-          broadcast(created, { t: 'snapshot', state: room.state, acks: room.ackRecord() });
+          broadcastState(created);
           room.flushEvents();
         }
       }
+      logStats(name, created);
     }, tickMs / 2),
   };
   rooms.set(name, created);
@@ -88,12 +170,22 @@ function getRoom(name: string): RoomEntry {
   return created;
 }
 
-/** Remove players of sessions whose grace period ran out; close empty rooms. */
+/** Remove players of sessions whose grace period ran out or that went idle; close empty rooms. */
 function expireSessions(name: string, entry: RoomEntry): void {
   const now = Date.now();
+  const idleLimit = entry.room.state.phase === 'lobby' ? IDLE_KICK_LOBBY_MS : IDLE_KICK_PLAYING_MS;
   for (const [id, s] of entry.sessions) {
-    if (s.client || s.disconnectedAt === null || now - s.disconnectedAt < RECONNECT_GRACE_MS) continue;
+    const graceOver = !s.client && s.disconnectedAt !== null && now - s.disconnectedAt >= RECONNECT_GRACE_MS;
+    const idle = s.client !== null && s.players.size > 0 && now - s.lastActiveAt >= idleLimit;
+    if (!graceOver && !idle) continue;
     for (const pid of s.players.values()) entry.room.removePlayer(pid);
+    s.players.clear();
+    if (idle) {
+      s.lastActiveAt = now;
+      s.client && send(s.client, { t: 'error', message: 'removed for being idle, press a button to rejoin' });
+      console.log(`[room ${name}] session ${id} idle-kicked`);
+      continue;
+    }
     entry.sessions.delete(id);
     console.log(`[room ${name}] session ${id} expired, ${entry.room.playerCount} players left`);
   }
@@ -128,9 +220,10 @@ function handle(c: Client, msg: ClientMsg): void {
         send(c, { t: 'error', message: `protocol v${msg.v} not supported, reload the page` });
         return;
       }
-      const name = String(msg.room || 'default').slice(0, 32);
-      const sessionId = String(msg.session || '').slice(0, 64);
+      const name = String(msg.room || 'default').replace(/[^\w-]/g, '').slice(0, 32) || 'default';
+      const sessionId = String(msg.session || '').replace(/[^\w-]/g, '').slice(0, 64);
       if (!sessionId) return send(c, { t: 'error', message: 'missing session id' });
+      if (!rooms.has(name) && rooms.size >= MAX_ROOMS) return send(c, { t: 'error', message: 'too many rooms' });
       const entry = getRoom(name);
       entry.clients.add(c);
       c.room = name;
@@ -143,7 +236,7 @@ function handle(c: Client, msg: ClientMsg): void {
         for (const pid of session.players.values()) entry.room.setConnected(pid, true);
         console.log(`[room ${name}] session ${sessionId} reconnected with ${session.players.size} players`);
       } else {
-        session = { id: sessionId, players: new Map(), client: c, disconnectedAt: null };
+        session = { id: sessionId, players: new Map(), client: c, disconnectedAt: null, lastActiveAt: Date.now() };
         entry.sessions.set(sessionId, session);
       }
       c.session = session;
@@ -159,8 +252,10 @@ function handle(c: Client, msg: ClientMsg): void {
       const existing = session.players.get(msg.slot);
       if (existing !== undefined) return send(c, { t: 'joined', slot: msg.slot, id: existing });
       if (entry.room.playerCount >= MAX_PLAYERS) return send(c, { t: 'error', message: 'room full' });
-      const id = entry.room.addPlayer(String(msg.name).slice(0, 16), Number(msg.color) & 0xffffff);
-      session.players.set(msg.slot, id);
+      const name = String(msg.name).replace(/[^\p{L}\p{N} _.-]/gu, '').slice(0, 16) || 'Nimetön';
+      const id = entry.room.addPlayer(name, Number(msg.color) & 0xffffff, session.id);
+      session.players.set(String(msg.slot).slice(0, 16), id);
+      session.lastActiveAt = Date.now();
       send(c, { t: 'joined', slot: msg.slot, id });
       console.log(`[room ${c.room}] player ${id} (${msg.name}) joined, ${entry.room.playerCount} total`);
       break;
@@ -182,17 +277,19 @@ function handle(c: Client, msg: ClientMsg): void {
       if (!entry || !c.session) return;
       const owned = new Set(c.session.players.values());
       const seq = Number(msg.seq);
-      if (!Number.isFinite(seq)) return;
-      for (const { id, input } of msg.inputs) {
-        if (!owned.has(id)) continue;
-        entry.room.pushInput(id, seq, {
-          fwd: !!input.fwd,
-          back: !!input.back,
-          left: !!input.left,
-          right: !!input.right,
-          throw: !!input.throw,
-        });
+      if (!Number.isFinite(seq) || !Array.isArray(msg.inputs)) return;
+      const view = Number.isFinite(Number(msg.view)) ? Math.floor(Number(msg.view)) : null;
+      for (const { id, input } of msg.inputs.slice(0, 8)) {
+        if (!owned.has(id) || !input) continue;
+        const clean = { fwd: !!input.fwd, back: !!input.back, left: !!input.left, right: !!input.right, throw: !!input.throw };
+        if (clean.fwd || clean.back || clean.left || clean.right || clean.throw) c.session.lastActiveAt = Date.now();
+        entry.room.pushInput(id, seq, clean, view);
       }
+      break;
+    }
+    case 'ack': {
+      const tick = Number(msg.tick);
+      if (Number.isFinite(tick) && tick > c.ackedTick) c.ackedTick = tick;
       break;
     }
     case 'ping':
@@ -214,6 +311,20 @@ const MIME: Record<string, string> = {
 };
 
 function serveStatic(req: IncomingMessage, res: ServerResponse): void {
+  if (req.url === '/stats') {
+    const out = [...rooms.entries()].map(([name, e]) => ({
+      room: name,
+      tick: e.room.state.tick,
+      phase: e.room.state.phase,
+      players: e.room.playerCount,
+      sessions: e.sessions.size,
+      sockets: e.clients.size,
+      queues: Object.fromEntries(e.room.state.players.map((p) => [p.id, e.room.queued(p.id)])),
+    }));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ rooms: out, connections: clients.size, uptimeSec: Math.round(process.uptime()) }));
+    return;
+  }
   if (!existsSync(DIST)) {
     res.writeHead(200, { 'content-type': 'text/plain' });
     res.end('Puukkohippa server running. Build the client with `pnpm build` to serve it from here.\n');
@@ -235,28 +346,59 @@ function serveStatic(req: IncomingMessage, res: ServerResponse): void {
 }
 
 const http = createServer(serveStatic);
-const wss = new WebSocketServer({ server: http });
+const wss = new WebSocketServer({ server: http, maxPayload: MAX_PAYLOAD_BYTES });
 
 const clients = new Set<Client>();
+const perIp = new Map<string, number>();
 
-wss.on('connection', (ws) => {
-  const c: Client = { ws, room: null, session: null, alive: true };
+function clientIp(req: IncomingMessage): string {
+  const fwd = req.headers['x-forwarded-for'];
+  const first = Array.isArray(fwd) ? fwd[0] : fwd?.split(',')[0];
+  return (first ?? req.socket.remoteAddress ?? 'unknown').trim();
+}
+
+/** Token bucket: refills at MAX_MESSAGES_PER_SEC, bursts up to one second's worth. */
+function allowMessage(c: Client): boolean {
+  const now = performance.now();
+  c.tokens = Math.min(MAX_MESSAGES_PER_SEC, c.tokens + ((now - c.tokensAt) / 1000) * MAX_MESSAGES_PER_SEC);
+  c.tokensAt = now;
+  if (c.tokens < 1) return false;
+  c.tokens -= 1;
+  return true;
+}
+
+wss.on('connection', (ws, req) => {
+  const ip = clientIp(req);
+  const count = perIp.get(ip) ?? 0;
+  if (count >= MAX_CONNECTIONS_PER_IP) {
+    ws.close(4001, 'too many connections from this address');
+    return;
+  }
+  perIp.set(ip, count + 1);
+  const c: Client = { ws, ip, room: null, session: null, alive: true, ackedTick: 0, tokens: MAX_MESSAGES_PER_SEC, tokensAt: performance.now() };
   clients.add(c);
+  let strikes = 0;
   ws.on('pong', () => {
     c.alive = true;
   });
   ws.on('message', (data) => {
+    if (!allowMessage(c)) {
+      // A client flooding far beyond the budget is cut off.
+      if (++strikes > MAX_MESSAGES_PER_SEC * 5) ws.close(4002, 'message rate limit');
+      return;
+    }
     const msg = decode<ClientMsg>(data.toString());
     if (msg && typeof msg === 'object' && 't' in msg) handle(c, msg);
   });
-  ws.on('close', () => {
-    clients.delete(c);
+  const gone = () => {
+    if (!clients.delete(c)) return;
+    const n = (perIp.get(ip) ?? 1) - 1;
+    if (n <= 0) perIp.delete(ip);
+    else perIp.set(ip, n);
     detach(c);
-  });
-  ws.on('error', () => {
-    clients.delete(c);
-    detach(c);
-  });
+  };
+  ws.on('close', gone);
+  ws.on('error', gone);
 });
 
 // Heartbeat: a client that stops answering pings (sleeping laptop, dead

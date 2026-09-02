@@ -80,6 +80,29 @@ src/client   Phaser 4: input slots, host abstraction, renderer, HUD
   layouts whose largest connected region is below 97 % of the free area.
 - Snapshots carry the events (conversions, throws, pickups, round changes)
   produced since the previous snapshot so the client can play effects.
+- Snapshots are delta-encoded (`src/net/delta.ts`). The server keeps the
+  last 3 s of sent snapshots per room; each client acknowledges the last
+  tick it applied and receives only the fields that changed since that
+  baseline (new players whole, removals by id, the knife when it changed).
+  A client whose baseline has expired gets a full snapshot. Idle players cost
+  about 10 bytes per snapshot instead of 200.
+- Lag compensation. Every input message carries the server tick the
+  client's remote view was rendered at. The room records player positions
+  for the last 64 ticks; when a puukottaja's touch or a thrown knife's hit
+  is checked, the target is taken from where the attacker saw it (at most
+  500 ms back). Players of the same session (couch co-players) are never
+  rewound against each other because the client predicts them live.
+- Extrapolation. When the render tick runs past the newest snapshot,
+  remote players continue along their heading at their last speed for up to
+  6 ticks (with wall resolution) and a remote flying knife keeps flying, so
+  a late snapshot causes drift-and-correct rather than a freeze.
+- Server hygiene: 4 kB max message, a 150 messages/s token bucket per
+  socket (flooders are closed), 32 sockets per IP, 64 rooms, sanitized room,
+  session and player names, at most 8 inputs per message. Sessions that
+  press nothing for 60 s in the lobby or 3 min in a round are removed. Each
+  room logs a stats line every 10 s (tick, phase, players, kB/s out, delta
+  vs full counts, tick overruns, input queue depth per player) and
+  `GET /stats` returns the same as JSON.
 
 ## Rendering
 
@@ -99,7 +122,4 @@ on the ground it has a soft shadow so its blocking footprint is visible.
 - Delta-compressed or binary snapshots (currently full JSON state at 20 Hz,
   roughly 200 bytes per player; fine for 32 players on a LAN or a decent
   connection).
-- Extrapolation of remote players when snapshots are late.
-- Lag compensation for touches and knife hits (rewinding remote players to
-  the thrower's view) if online play across the internet feels unfair.
-- Idle kick for players who send no input for a long time in the lobby.
+- Binary snapshot encoding (deltas are still JSON).

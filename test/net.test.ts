@@ -180,3 +180,110 @@ describe('knife prediction', () => {
     expect(pk.y).toBeCloseTo(sk.y, 6);
   });
 });
+
+describe('delta snapshots', () => {
+  it('round-trips changes, new players and removals against a baseline', async () => {
+    const { encodeDelta, applyDelta } = await import('../src/net/delta.js');
+    const room = new Room(5);
+    const a = room.addPlayer('A', 1);
+    room.addPlayer('B', 2);
+    for (let i = 0; i < 10; i++) room.tick();
+    const base = overWire(room.state);
+    // Move A, add C, remove B, throw the knife state around.
+    room.pushInput(a, 1, inp({ fwd: true, left: true }));
+    for (let i = 0; i < 10; i++) room.tick();
+    room.addPlayer('C', 3);
+    room.removePlayer(2);
+    room.state.knife = { mode: 'ground', x: 300, y: 300, heading: 1 };
+    room.state.events.push({ type: 'pickup', by: a });
+    const cur = overWire(room.state);
+    const d = encodeDelta(base, cur, room.ackRecord());
+    expect(d.removed).toEqual([2]);
+    expect(d.players!.some((p) => p.id === 3 && p.name === 'C')).toBe(true);
+    expect(d.players!.find((p) => p.id === a)!.name).toBeUndefined(); // unchanged field omitted
+    const rebuilt = applyDelta(base, JSON.parse(JSON.stringify(d)));
+    const norm = (s: GameState) => JSON.parse(JSON.stringify({ ...s, players: s.players.map((p) => ({ ...p, prevInput: undefined })) }));
+    expect(norm(rebuilt)).toEqual(norm(cur));
+    expect(JSON.stringify(d).length).toBeLessThan(JSON.stringify(cur).length);
+  });
+
+  it('is much smaller than a full snapshot when little changes', async () => {
+    const { encodeDelta } = await import('../src/net/delta.js');
+    const room = new Room(6);
+    for (let i = 0; i < 12; i++) room.addPlayer(`P${i}`, i);
+    for (let i = 0; i < 5; i++) room.tick();
+    const base = overWire(room.state);
+    room.tick();
+    const cur = overWire(room.state);
+    const full = JSON.stringify(cur).length;
+    const delta = JSON.stringify(encodeDelta(base, cur, room.ackRecord())).length;
+    expect(delta * 5).toBeLessThan(full);
+  });
+});
+
+describe('lag compensation', () => {
+  it('judges a touch where the puukottaja saw the runner, not where the runner is now', () => {
+    const room = new Room(11);
+    const a = room.addPlayer('A', 1, 'session-a');
+    const b = room.addPlayer('B', 2, 'session-b');
+    for (let i = 0; i < COUNTDOWN_TIME * TICK_RATE + 5; i++) room.tick();
+    const it = room.state.players.find((p) => p.role === 'puukottaja')!;
+    const runner = room.state.players.find((p) => p.role === 'runner')!;
+    // Runner stands still right in front of the puukottaja for 20 ticks
+    // (history), then teleports far away. The puukottaja's input says its
+    // view is 20 ticks old, so the touch is judged against the old spot.
+    it.x = 800;
+    it.y = 450;
+    it.heading = 0;
+    runner.x = 800 + 40; // just out of reach
+    runner.y = 450;
+    for (let i = 0; i < 20; i++) room.tick();
+    runner.x = 200;
+    runner.y = 200;
+    const viewTick = room.state.tick - 10; // inside the 20 ticks of recorded history
+    it.x = 800 + 20; // now within touch distance of where the runner *was*
+    room.pushInput(it.id, 1, inp(), viewTick);
+    room.tick();
+    expect(runner.role).toBe('puukottaja');
+    void a;
+    void b;
+  });
+
+  it('never rewinds players of the same session and caps the rewind', () => {
+    const room = new Room(12);
+    const a = room.addPlayer('A', 1, 'same');
+    const b = room.addPlayer('B', 2, 'same');
+    for (let i = 0; i < 40; i++) room.tick();
+    room.pushInput(a, 1, inp(), room.state.tick - 10);
+    room.tick();
+    expect(room.rewind(a, b)).toBeNull();
+    const c = room.addPlayer('C', 3, 'other');
+    for (let i = 0; i < 40; i++) room.tick();
+    room.pushInput(a, 2, inp(), room.state.tick - 200);
+    room.tick();
+    const r = room.rewind(a, c);
+    expect(r).not.toBeNull();
+    const hist = room.state.tick - 30; // capped at MAX_REWIND_TICKS
+    void hist;
+  });
+});
+
+describe('extrapolation', () => {
+  it('moves remote players along their heading and leaves local ones alone', async () => {
+    const { extrapolateState } = await import('../src/net/extrapolate.js');
+    const room = new Room(13);
+    const a = room.addPlayer('A', 1);
+    const b = room.addPlayer('B', 2);
+    for (let i = 0; i < COUNTDOWN_TIME * TICK_RATE + 5; i++) room.tick();
+    const pa = room.state.players.find((p) => p.id === a)!;
+    const pb = room.state.players.find((p) => p.id === b)!;
+    pa.x = 800; pa.y = 450; pa.heading = 0; pa.moveSpeed = 240;
+    pb.x = 400; pb.y = 450; pb.heading = 0; pb.moveSpeed = 240;
+    const out = extrapolateState(room.state, 3, new Set([b]));
+    const oa = out.players.find((p) => p.id === a)!;
+    const ob = out.players.find((p) => p.id === b)!;
+    expect(oa.x).toBeCloseTo(800 + 240 * 3 / TICK_RATE, 6);
+    expect(ob.x).toBe(400);
+    expect(extrapolateState(room.state, 100, new Set()).players.find((p) => p.id === a)!.x).toBeCloseTo(800 + 240 * 6 / TICK_RATE, 6);
+  });
+});

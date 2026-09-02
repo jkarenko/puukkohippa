@@ -1,3 +1,5 @@
+import { applyDelta, type DeltaMsg } from '../net/delta.js';
+import { extrapolateState } from '../net/extrapolate.js';
 import { PROTOCOL_VERSION, decode, encode, type ClientMsg, type ServerMsg } from '../net/protocol.js';
 import { Room } from '../net/room.js';
 import { TICK_RATE } from '../sim/constants.js';
@@ -22,6 +24,10 @@ export interface Frame {
 
 export interface NetStats {
   rttMs: number;
+  /** Deltas that referenced a baseline we no longer had (should stay 0). */
+  deltaMisses: number;
+  /** Ticks the remote view is currently extrapolated ahead of the newest snapshot. */
+  extrapolated: number;
   /** Inputs sent but not yet acknowledged by a snapshot (per local player, max). */
   unacked: number;
   /** Distance of the last reconciliation correction, px. */
@@ -184,7 +190,7 @@ export class NetHost implements Host {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private lastPingAt = 0;
   private closed = false;
-  private readonly netStats: NetStats = { rttMs: 0, unacked: 0, lastCorrection: 0 };
+  private readonly netStats: NetStats = { rttMs: 0, deltaMisses: 0, extrapolated: 0, unacked: 0, lastCorrection: 0 };
 
   constructor(
     private readonly url: string,
@@ -255,6 +261,10 @@ export class NetHost implements Host {
       }
       case 'snapshot':
         this.onSnapshot(msg.state, msg.acks);
+        this.send({ t: 'ack', tick: msg.state.tick });
+        break;
+      case 'delta':
+        this.onDelta(msg);
         break;
       case 'pong':
         this.netStats.rttMs = performance.now() - msg.sent;
@@ -263,6 +273,21 @@ export class NetHost implements Host {
         this.status = `server: ${msg.message}`;
         break;
     }
+  }
+
+  private onDelta(d: DeltaMsg): void {
+    const base = this.snapshots.find((s) => s.tick === d.base);
+    if (!base) {
+      // We no longer have the baseline; keep acking what we have so the
+      // server falls back to a full snapshot.
+      const newest = this.snapshots[this.snapshots.length - 1];
+      if (newest) this.send({ t: 'ack', tick: newest.tick });
+      this.netStats.deltaMisses++;
+      return;
+    }
+    const state = applyDelta(base.state, d);
+    this.onSnapshot(state, d.acks);
+    this.send({ t: 'ack', tick: state.tick });
   }
 
   private onSnapshot(state: GameState, acks: Record<string, number>): void {
@@ -377,7 +402,7 @@ export class NetHost implements Host {
           this.predictKnife(latest, lp.predicted, intent.kind === 'none' ? null : { intent, charge: chargeBefore });
         }
       }
-      this.send({ t: 'input', seq: this.clientTick, inputs: batch });
+      this.send({ t: 'input', seq: this.clientTick, view: Math.floor(this.renderTick()), inputs: batch });
       this.stepKnifePrediction(latest);
     }
     if (nowMs - this.lastPingAt > 2000) {
@@ -463,14 +488,26 @@ export class NetHost implements Host {
     return { state: { ...base, players, knife }, events };
   }
 
+  /** Server tick the remote view is rendered at (fractional). */
+  private renderTick(): number {
+    if (this.tickOffset === null) return 0;
+    return (performance.now() - this.tickOffset) / TICK_MS - INTERP_DELAY_TICKS;
+  }
+
   /** Remote view of the world at the render tick, interpolated by server tick. */
   private interpolated(): GameState | null {
     const n = this.snapshots.length;
     if (n === 0 || this.tickOffset === null) return null;
     const newest = this.snapshots[n - 1]!;
+    const renderTick = this.renderTick();
+    if (renderTick >= newest.tick) {
+      // Snapshots are late: dead-reckon remote players for a few ticks.
+      const ahead = renderTick - newest.tick;
+      this.netStats.extrapolated = Math.min(6, Math.floor(ahead));
+      return extrapolateState(newest.state, ahead, new Set(this.local.keys()));
+    }
+    this.netStats.extrapolated = 0;
     if (n === 1) return newest.state;
-    const renderTick = (performance.now() - this.tickOffset) / TICK_MS - INTERP_DELAY_TICKS;
-    if (renderTick >= newest.tick) return newest.state;
     const oldest = this.snapshots[0]!;
     if (renderTick <= oldest.tick) return oldest.state;
     for (let i = 0; i < n - 1; i++) {

@@ -126,7 +126,9 @@ export class GameScene extends Phaser.Scene {
     const mul = runnerSpeedMultiplier(state);
     const st = this.host.stats();
     const rtt = st
-      ? ` · rtt ${Math.round(st.rttMs)} ms · unacked ${st.unacked} · corr ${st.lastCorrection.toFixed(1)} px`
+      ? ` · rtt ${Math.round(st.rttMs)} ms · unacked ${st.unacked} · corr ${st.lastCorrection.toFixed(1)} px` +
+        (st.extrapolated ? ` · extrapolating ${st.extrapolated}` : '') +
+        (st.deltaMisses ? ` · delta misses ${st.deltaMisses}` : '')
       : '';
     this.hud.setText(
       `Round ${state.round} · ${secs}s · Runners ${runners} · Puukottajat ${puukottajat} · runner speed ×${mul.toFixed(2)}\n` +

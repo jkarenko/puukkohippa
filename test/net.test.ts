@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { decode, encode, normalizeRoomName } from '../src/net/protocol.js';
 import { Room } from '../src/net/room.js';
 import { getArena } from '../src/sim/arena.js';
-import { COUNTDOWN_TIME, TICK_RATE } from '../src/sim/constants.js';
-import { createThrow, flyKnife, predictLocalPlayer } from '../src/sim/sim.js';
+import { COUNTDOWN_TIME, KNIFE_FLY_RADIUS, KNIFE_RECATCH_DELAY, PLAYER_RADIUS, TICK_RATE } from '../src/sim/constants.js';
+import { createThrow, flyKnife, predictLocalPlayer, separateBodies } from '../src/sim/sim.js';
 import { EMPTY_INPUT, copyInput, type GameState, type KnifeState, type PlayerInput } from '../src/sim/types.js';
 
 function inp(partial: Partial<PlayerInput> = {}): PlayerInput {
@@ -297,5 +297,89 @@ describe('room names', () => {
     expect(normalizeRoomName('')).toBe('default');
     expect(normalizeRoomName(null)).toBe('default');
     expect(normalizeRoomName('x'.repeat(50))).toHaveLength(32);
+  });
+});
+
+describe('two local players on one device', () => {
+  it('a predicted throw at a local runner is caught on the same tick as on the server', () => {
+    const room = new Room(303);
+    room.addPlayer('A', 1, 's');
+    room.addPlayer('B', 2, 's');
+    for (let i = 0; i < COUNTDOWN_TIME * TICK_RATE + 5; i++) room.tick();
+    const holder = room.state.players.find((p) => p.role === 'puukottaja')!;
+    const runner = room.state.players.find((p) => p.role === 'runner')!;
+    // An open horizontal stretch: no obstacle within 20 px of the line for `needed` px.
+    const arenaNow = getArena(room.state.seed);
+    const needed = 420;
+    let row: { x: number; y: number } | null = null;
+    for (let y = 80; y < arenaNow.height - 80 && !row; y += 20) {
+      for (let x = 80; x < arenaNow.width - needed - 80 && !row; x += 20) {
+        let ok = true;
+        for (let dx = -40; dx <= needed + 40 && ok; dx += 6) {
+          for (const o of arenaNow.obstacles) {
+            const cx = x + dx;
+            if (cx + 20 > o.x && cx - 20 < o.x + o.w && y + 20 > o.y && y - 20 < o.y + o.h) { ok = false; break; }
+          }
+        }
+        if (ok) row = { x, y };
+      }
+    }
+    if (!row) throw new Error('no open row');
+    holder.x = row.x; holder.y = row.y; holder.heading = 0;
+    runner.x = row.x + 350; runner.y = row.y; runner.heading = 0;
+    const snapshot = overWire(room.state);
+    const arena = getArena(snapshot.seed);
+    const locals = snapshot.players.map((p) => ({ ...p, prevInput: copyInput(EMPTY_INPUT) }));
+    const ph = locals.find((p) => p.id === holder.id)!;
+    let predictedKnife: KnifeState | null = null;
+    let predictedCatchTick = -1;
+    let serverCatchTick = -1;
+    const inputs: PlayerInput[] = [];
+    for (let k = 0; k < 40; k++) inputs.push(inp({ throw: k < 30 }));
+    let clientTick = 0;
+    const clientStep = (input: PlayerInput) => {
+      clientTick++;
+      const chargeBefore = ph.charge;
+      const intent = predictLocalPlayer(snapshot, ph, input);
+      for (const p of locals) if (p.id !== ph.id) predictLocalPlayer(snapshot, p, inp());
+      separateBodies(arena, locals[0]!, locals[1]!);
+      if (intent.kind === 'straight') predictedKnife = createThrow(arena, ph, ph.heading, chargeBefore, -1);
+      if (predictedKnife?.mode === 'flying') {
+        const fk = predictedKnife;
+        const r = flyKnife(arena, fk, (f) => {
+          for (const p of locals) {
+            if (p.id === f.thrower && f.airTime < KNIFE_RECATCH_DELAY) continue;
+            if (Math.hypot(p.x - f.x, p.y - f.y) < PLAYER_RADIUS + KNIFE_FLY_RADIUS) {
+              predictedKnife = { mode: 'held', holder: p.id };
+              predictedCatchTick = clientTick;
+              return true;
+            }
+          }
+          return false;
+        });
+        if (predictedKnife?.mode === 'flying') predictedKnife = r;
+      }
+    };
+    let serverTicks = 0;
+    const serverStep = () => {
+      room.tick();
+      serverTicks++;
+      if (serverCatchTick < 0 && room.state.knife.mode === 'held' && room.state.knife.holder === runner.id) serverCatchTick = serverTicks;
+    };
+    inputs.forEach((input, i) => {
+      room.pushInput(holder.id, i + 1, input);
+      room.pushInput(runner.id, i + 1, inp());
+      clientStep(input);
+      if (i >= 2) serverStep(); // server runs 2 ticks behind
+    });
+    for (let i = 0; i < 100; i++) {
+      clientStep(inp());
+      serverStep();
+    }
+    expect(predictedKnife).toEqual({ mode: 'held', holder: runner.id });
+    expect(room.state.knife).toEqual({ mode: 'held', holder: runner.id });
+    expect(runner.role).toBe('puukottaja');
+    // Server tick n applies input seq n, exactly like client tick n: the catch lands on the same tick.
+    expect(serverCatchTick).toBe(predictedCatchTick);
   });
 });

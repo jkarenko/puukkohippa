@@ -2,10 +2,10 @@ import { applyDelta, type DeltaMsg } from '../net/delta.js';
 import { extrapolateState } from '../net/extrapolate.js';
 import { PROTOCOL_VERSION, decode, encode, type ClientMsg, type ServerMsg } from '../net/protocol.js';
 import { Room } from '../net/room.js';
-import { TICK_RATE } from '../sim/constants.js';
+import { KNIFE_FLY_RADIUS, KNIFE_RECATCH_DELAY, PLAYER_RADIUS, TICK_RATE } from '../sim/constants.js';
 import { lerp, lerpAngle } from '../sim/geom.js';
 import { getArena } from '../sim/arena.js';
-import { createThrow, flyKnife, predictLocalPlayer, touchesGroundKnife } from '../sim/sim.js';
+import { createThrow, flyKnife, predictLocalPlayer, separateBodies, touchesGroundKnife } from '../sim/sim.js';
 import {
   EMPTY_INPUT,
   copyInput,
@@ -192,6 +192,15 @@ export class NetHost implements Host {
   private readonly local = new Map<number, LocalPlayer>();
   private readonly session = sessionId();
   private knifePred: KnifePrediction | null = null;
+  /**
+   * True while the knife's last owner or thrower was one of our players. Such
+   * a knife is drawn on the present timeline (newest snapshot, extrapolated)
+   * so it never lags behind the predicted player; a knife in remote hands is
+   * drawn on the interpolated timeline that matches the remote players.
+   */
+  private knifeLocal = false;
+  /** Players as drawn last frame; the predicted knife checks hits against them. */
+  private lastDrawn: PlayerState[] = [];
   private clientTick = 0;
   private acc = 0;
   private last = -1;
@@ -314,6 +323,11 @@ export class NetHost implements Host {
     const off = at - state.tick * TICK_MS;
     this.tickOffset = this.tickOffset === null ? off : this.tickOffset + (off - this.tickOffset) * 0.1;
 
+    const k = state.knife;
+    if (k.mode === 'held') this.knifeLocal = this.local.has(k.holder);
+    else if (k.mode === 'flying') this.knifeLocal = this.local.has(k.thrower);
+    // On the ground it keeps the timeline of whoever last had it.
+
     this.reconcile(state, acks);
     this.reconcileKnife(state);
   }
@@ -324,22 +338,29 @@ export class NetHost implements Host {
     if (!kp) return;
     const k = state.knife;
     if (kp.kind === 'throw') {
-      // Keep the predicted flight while the server still shows the knife in the
-      // thrower's hand (not applied yet) or flying (same deterministic path);
-      // switch to truth when it has landed or someone caught it.
-      const stillOurs = k.mode === 'held' && k.holder === kp.by;
-      const flying = k.mode === 'flying' && k.thrower === kp.by;
-      if (!stillOurs && !flying) this.knifePred = null;
-      else if (flying && kp.knife.mode === 'ground') this.knifePred = null;
-    } else {
+      // The predicted flight is the server's flight, just earlier: keep it
+      // while the server still shows the knife in the thrower's hand (throw
+      // not applied yet) or in the air. Switch to the truth once the server
+      // has landed it or someone holds it, which is where the prediction
+      // already is (deterministic) or where we mispredicted.
+      const notAppliedYet = k.mode === 'held' && k.holder === kp.by;
+      const inFlight = k.mode === 'flying' && k.thrower === kp.by;
+      if (notAppliedYet) {
+        if (state.tick - kp.sinceTick > KNIFE_PREDICTION_TIMEOUT_TICKS) this.knifePred = null; // never happened
+      } else if (!inFlight) {
+        this.knifePred = null;
+      }
+    } else if (k.mode === 'held' || k.mode === 'flying') {
       // Pickup confirmed, or the knife went somewhere else entirely.
-      if (k.mode === 'held' || k.mode === 'flying') this.knifePred = null;
+      this.knifePred = null;
     }
   }
 
   /** Rebuild each local player's prediction from the authoritative snapshot. */
   private reconcile(state: GameState, acks: Record<string, number>): void {
     let maxUnacked = 0;
+    const before = new Map<number, PlayerState>();
+    const replay = new Map<number, LocalPlayer>();
     for (const [id, lp] of this.local) {
       const authoritative = state.players.find((p) => p.id === id);
       if (!authoritative) {
@@ -351,26 +372,43 @@ export class NetHost implements Host {
         lp.lastAcked = lp.pending.shift()!.input;
       }
       maxUnacked = Math.max(maxUnacked, lp.pending.length);
-
-      const before = lp.predicted;
-      const next: PlayerState = { ...authoritative, prevInput: copyInput(lp.lastAcked) };
-      for (const { input } of lp.pending) predictLocalPlayer(state, next, input);
-
-      if (before) {
-        // Carry the visual difference so the correction is smoothed, not popped.
-        const dx = before.x + lp.errX - next.x;
-        const dy = before.y + lp.errY - next.y;
-        const dist = Math.hypot(dx, dy);
-        this.netStats.lastCorrection = Math.hypot(before.x - next.x, before.y - next.y);
-        if (dist > SNAP_DISTANCE || before.role !== next.role) {
-          lp.errX = lp.errY = lp.errHeading = 0;
-        } else {
-          lp.errX = dx;
-          lp.errY = dy;
-          lp.errHeading = wrap(before.heading + lp.errHeading - next.heading);
-        }
+      if (lp.predicted) before.set(id, lp.predicted);
+      lp.predicted = { ...authoritative, prevInput: copyInput(lp.lastAcked) };
+      replay.set(id, lp);
+    }
+    // Replay seq by seq across all local players, separating them after each
+    // tick exactly like the server does.
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const lp of replay.values()) {
+      if (lp.pending.length) {
+        lo = Math.min(lo, lp.pending[0]!.seq);
+        hi = Math.max(hi, lp.pending[lp.pending.length - 1]!.seq);
       }
-      lp.predicted = next;
+    }
+    for (let seq = lo; seq <= hi; seq++) {
+      for (const lp of replay.values()) {
+        const e = lp.pending.find((q) => q.seq === seq);
+        if (e && lp.predicted) predictLocalPlayer(state, lp.predicted, e.input);
+      }
+      this.separateLocals(state);
+    }
+    for (const [id, lp] of replay) {
+      const prev = before.get(id);
+      const next = lp.predicted!;
+      if (!prev) continue;
+      // Carry the visual difference so the correction is smoothed, not popped.
+      const dx = prev.x + lp.errX - next.x;
+      const dy = prev.y + lp.errY - next.y;
+      const dist = Math.hypot(dx, dy);
+      this.netStats.lastCorrection = Math.hypot(prev.x - next.x, prev.y - next.y);
+      if (dist > SNAP_DISTANCE || prev.role !== next.role) {
+        lp.errX = lp.errY = lp.errHeading = 0;
+      } else {
+        lp.errX = dx;
+        lp.errY = dy;
+        lp.errHeading = wrap(prev.heading + lp.errHeading - next.heading);
+      }
     }
     this.netStats.unacked = maxUnacked;
   }
@@ -413,6 +451,7 @@ export class NetHost implements Host {
           this.predictKnife(latest, lp.predicted, intent.kind === 'none' ? null : { intent, charge: chargeBefore });
         }
       }
+      if (latest) this.separateLocals(latest);
       this.send({ t: 'input', seq: this.clientTick, view: Math.floor(this.renderTick()), inputs: batch });
       this.stepKnifePrediction(latest);
     }
@@ -422,16 +461,26 @@ export class NetHost implements Host {
     }
   }
 
+  /**
+   * Body separation between our own players is deterministic (both are
+   * predicted exactly), so predict it too; otherwise two players on one
+   * device bumping into each other get corrected every snapshot.
+   */
+  private separateLocals(latest: GameState): void {
+    const ps: PlayerState[] = [];
+    for (const lp of this.local.values()) if (lp.predicted) ps.push(lp.predicted);
+    if (ps.length < 2) return;
+    const arena = getArena(latest.seed);
+    for (let i = 0; i < ps.length; i++) for (let j = i + 1; j < ps.length; j++) separateBodies(arena, ps[i]!, ps[j]!);
+  }
+
   /** Start a knife prediction for a local player's throw or pickup. */
   private predictKnife(
     latest: GameState,
     p: PlayerState,
     release: { intent: ReturnType<typeof predictLocalPlayer>; charge: number } | null,
   ): void {
-    if (this.knifePred) {
-      if (this.clientTick - this.knifePred.sinceTick > KNIFE_PREDICTION_TIMEOUT_TICKS) this.knifePred = null;
-      else return;
-    }
+    if (this.knifePred) return;
     const serverKnife = latest.knife;
     const arena = getArena(latest.seed);
     if (release && serverKnife.mode === 'held' && serverKnife.holder === p.id) {
@@ -439,35 +488,49 @@ export class NetHost implements Host {
       let angle = p.heading;
       let target = -1;
       if (it.kind === 'pass') {
-        angle = Math.atan2(it.target.y - p.y, it.target.x - p.x);
+        // A local target's predicted position is what the server will see when it applies the throw.
+        const t = this.local.get(it.target.id)?.predicted ?? it.target;
+        angle = Math.atan2(t.y - p.y, t.x - p.x);
         target = it.target.id;
       }
       const knife = createThrow(arena, p, angle, release.charge, target);
-      if (knife) this.knifePred = { knife, kind: 'throw', by: p.id, sinceTick: this.clientTick };
+      if (knife) this.knifePred = { knife, kind: 'throw', by: p.id, sinceTick: latest.tick };
       return;
     }
-    if (p.role === 'puukottaja' && latest.phase === 'playing' && touchesGroundKnife(this.presentKnife(latest) ?? serverKnife, p)) {
-      this.knifePred = { knife: { mode: 'held', holder: p.id }, kind: 'pickup', by: p.id, sinceTick: this.clientTick };
+    if (p.role === 'puukottaja' && latest.phase === 'playing' && touchesGroundKnife(this.presentKnife(latest), p)) {
+      this.knifePred = { knife: { mode: 'held', holder: p.id }, kind: 'pickup', by: p.id, sinceTick: latest.tick };
     }
-  }
-
-  private stepKnifePrediction(latest: GameState | null): void {
-    const kp = this.knifePred;
-    if (!kp || !latest || kp.knife.mode !== 'flying') return;
-    const result = flyKnife(getArena(latest.seed), { ...kp.knife }, null);
-    kp.knife = result;
   }
 
   /**
-   * The newest server knife advanced to "now" when a local player threw it,
-   * so it lines up with that player's predicted position. Remote throws are
-   * left to the interpolated view (which matches the remote players).
+   * Fly the predicted knife one tick and let it hit players as drawn: local
+   * players at their predicted positions (exactly what the server will see
+   * for them) and remote players at their interpolated positions (which is
+   * what the server's lag compensation rewinds them to for our throws).
    */
-  private presentKnife(latest: GameState): KnifeState | null {
+  private stepKnifePrediction(latest: GameState | null): void {
+    const kp = this.knifePred;
+    if (!kp || !latest || kp.knife.mode !== 'flying') return;
+    const drawn = this.lastDrawn;
+    const result = flyKnife(getArena(latest.seed), { ...kp.knife }, (fk) => {
+      for (const p of drawn) {
+        if (!p.connected) continue;
+        if (p.id === fk.thrower && fk.airTime < KNIFE_RECATCH_DELAY) continue;
+        if (Math.hypot(p.x - fk.x, p.y - fk.y) >= PLAYER_RADIUS + KNIFE_FLY_RADIUS) continue;
+        kp.knife = { mode: 'held', holder: p.id };
+        return true;
+      }
+      return false;
+    });
+    if (kp.knife.mode === 'flying') kp.knife = result;
+  }
+
+  /** The newest server knife, advanced to "now" while flying so it keeps up with the predicted thrower. */
+  private presentKnife(latest: GameState): KnifeState {
     const k = latest.knife;
-    if (k.mode !== 'flying' || !this.local.has(k.thrower)) return null;
+    if (k.mode !== 'flying') return k;
     const newest = this.snapshots[this.snapshots.length - 1];
-    if (!newest) return null;
+    if (!newest) return k;
     const ahead = Math.max(0, Math.min(10, Math.round((performance.now() - newest.at) / TICK_MS)));
     const arena = getArena(latest.seed);
     let cur: KnifeState = { ...k };
@@ -495,7 +558,8 @@ export class NetHost implements Host {
       return { ...lp.predicted, x: lp.predicted.x + lp.errX, y: lp.predicted.y + lp.errY, heading: lp.predicted.heading + lp.errHeading };
     });
     const latest = this.snapshots[this.snapshots.length - 1]?.state ?? base;
-    const knife = this.knifePred?.knife ?? this.presentKnife(latest) ?? base.knife;
+    const knife = this.knifePred?.knife ?? (this.knifeLocal ? this.presentKnife(latest) : base.knife);
+    this.lastDrawn = players;
     return { state: { ...base, players, knife }, events };
   }
 

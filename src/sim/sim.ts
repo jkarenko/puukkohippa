@@ -422,25 +422,26 @@ function playerInteractions(
     }
   }
   for (let i = 0; i < ps.length; i++) {
-    for (let j = i + 1; j < ps.length; j++) {
-      const a = ps[i]!;
-      const b = ps[j]!;
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
-      const d = Math.hypot(dx, dy);
-      if (d >= minD) continue;
-      // Separate overlapping bodies.
-      const nx = d > 1e-6 ? dx / d : 1;
-      const ny = d > 1e-6 ? dy / d : 0;
-      const push = (minD - d) / 2;
-      a.x -= nx * push;
-      a.y -= ny * push;
-      b.x += nx * push;
-      b.y += ny * push;
-      resolveObstacles(arena, a, PLAYER_RADIUS);
-      resolveObstacles(arena, b, PLAYER_RADIUS);
-    }
+    for (let j = i + 1; j < ps.length; j++) separateBodies(arena, ps[i]!, ps[j]!);
   }
+}
+
+/** Push two overlapping players apart (half each) and keep them out of walls. Shared with prediction. */
+export function separateBodies(arena: Arena, a: PlayerState, b: PlayerState): void {
+  const minD = PLAYER_RADIUS * 2;
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const d = Math.hypot(dx, dy);
+  if (d >= minD) return;
+  const nx = d > 1e-6 ? dx / d : 1;
+  const ny = d > 1e-6 ? dy / d : 0;
+  const push = (minD - d) / 2;
+  a.x -= nx * push;
+  a.y -= ny * push;
+  b.x += nx * push;
+  b.y += ny * push;
+  resolveObstacles(arena, a, PLAYER_RADIUS);
+  resolveObstacles(arena, b, PLAYER_RADIUS);
 }
 
 export interface StepOptions {

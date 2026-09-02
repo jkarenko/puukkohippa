@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decode, encode } from '../src/net/protocol.js';
+import { decode, encode, normalizeRoomName } from '../src/net/protocol.js';
 import { Room } from '../src/net/room.js';
 import { getArena } from '../src/sim/arena.js';
 import { COUNTDOWN_TIME, TICK_RATE } from '../src/sim/constants.js';
@@ -285,5 +285,17 @@ describe('extrapolation', () => {
     expect(oa.x).toBeCloseTo(800 + 240 * 3 / TICK_RATE, 6);
     expect(ob.x).toBe(400);
     expect(extrapolateState(room.state, 100, new Set()).players.find((p) => p.id === a)!.x).toBeCloseTo(800 + 240 * 6 / TICK_RATE, 6);
+  });
+});
+
+describe('room names', () => {
+  it('keeps Finnish letters, ignores case and strips the rest', () => {
+    expect(normalizeRoomName('Löyly')).toBe('löyly');
+    expect(normalizeRoomName('sauna ö!')).toBe('saunaö');
+    expect(normalizeRoomName('Sauna')).toBe(normalizeRoomName('sauna'));
+    expect(normalizeRoomName('kissa-koira_1')).toBe('kissa-koira_1');
+    expect(normalizeRoomName('')).toBe('default');
+    expect(normalizeRoomName(null)).toBe('default');
+    expect(normalizeRoomName('x'.repeat(50))).toHaveLength(32);
   });
 });

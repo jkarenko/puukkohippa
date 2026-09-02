@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, join, normalize, resolve } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { encodeDelta } from '../src/net/delta.js';
-import { DEFAULT_PORT, PROTOCOL_VERSION, decode, encode, type ClientMsg, type ServerMsg } from '../src/net/protocol.js';
+import { DEFAULT_PORT, PROTOCOL_VERSION, decode, encode, normalizeRoomName, type ClientMsg, type ServerMsg } from '../src/net/protocol.js';
 import { Room } from '../src/net/room.js';
 import { MAX_PLAYERS, SNAPSHOT_EVERY_TICKS, TICK_RATE } from '../src/sim/constants.js';
 import { hashString } from '../src/sim/rng.js';
@@ -220,7 +220,7 @@ function handle(c: Client, msg: ClientMsg): void {
         send(c, { t: 'error', message: `protocol v${msg.v} not supported, reload the page` });
         return;
       }
-      const name = String(msg.room || 'default').replace(/[^\w-]/g, '').slice(0, 32) || 'default';
+      const name = normalizeRoomName(msg.room);
       const sessionId = String(msg.session || '').replace(/[^\w-]/g, '').slice(0, 64);
       if (!sessionId) return send(c, { t: 'error', message: 'missing session id' });
       if (!rooms.has(name) && rooms.size >= MAX_ROOMS) return send(c, { t: 'error', message: 'too many rooms' });

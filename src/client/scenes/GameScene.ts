@@ -1,5 +1,5 @@
 import Phaser from 'phaser';
-import { DEFAULT_PORT } from '../../net/protocol.js';
+import { DEFAULT_PORT, normalizeRoomName } from '../../net/protocol.js';
 import { getArena } from '../../sim/arena.js';
 import { ARENA_H, ARENA_W, MAX_PLAYERS, TICK_RATE } from '../../sim/constants.js';
 import { hashString } from '../../sim/rng.js';
@@ -28,7 +28,7 @@ interface Options {
 
 function readOptions(): Options {
   const q = new URLSearchParams(location.search);
-  const room = q.get('room');
+  const room = q.has('room') ? normalizeRoomName(q.get('room')) : null;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const defaultServer =
     location.port === '5173' || location.port === '' && location.hostname === 'localhost'

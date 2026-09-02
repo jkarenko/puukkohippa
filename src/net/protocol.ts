@@ -43,3 +43,17 @@ export function decode<T>(raw: string): T | null {
     return null;
   }
 }
+
+/**
+ * Canonical room name: Unicode letters and digits, `-` and `_`, lower-cased,
+ * at most 32 characters. Case-insensitive so a phone keyboard capitalising
+ * "Sauna" lands in the same room as "sauna". Empty input means "default".
+ */
+export function normalizeRoomName(raw: string | null | undefined): string {
+  const cleaned = String(raw ?? '')
+    .normalize('NFC')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}_-]/gu, '')
+    .slice(0, 32);
+  return cleaned || 'default';
+}

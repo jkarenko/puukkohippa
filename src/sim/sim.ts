@@ -259,22 +259,26 @@ function movePlayer(state: GameState, arena: Arena, p: PlayerState, input: Playe
   resolveObstacles(arena, p, PLAYER_RADIUS);
 }
 
-function updateThrowing(state: GameState, p: PlayerState, input: PlayerInput, interactive: boolean): void {
+type ChargeResult = { kind: 'none' } | { kind: 'straight' } | { kind: 'pass'; target: PlayerState };
+
+/**
+ * Charge bookkeeping shared by the authoritative step and client prediction.
+ * Mutates `p.charge` and reports whether a throw should happen this tick.
+ */
+function updateCharge(state: GameState, p: PlayerState, input: PlayerInput, interactive: boolean): ChargeResult {
   const holding = state.knife.mode === 'held' && state.knife.holder === p.id;
   if (!holding || !interactive) {
     p.charge = -1;
-    return;
+    return { kind: 'none' };
   }
   const prev = p.prevInput;
   if (p.charge < 0) {
     if (input.throw && !prev.throw) p.charge = 0;
-    return;
+    return { kind: 'none' };
   }
   if (!input.throw) {
-    // Released: straight throw ahead.
-    throwKnife(state, p, p.heading, p.charge, -1);
     p.charge = -1;
-    return;
+    return { kind: 'straight' };
   }
   p.charge = Math.min(1, p.charge + DT / CHARGE_TIME);
   // A freshly pressed direction while charging passes to a fellow puukottaja.
@@ -283,12 +287,21 @@ function updateThrowing(state: GameState, p: PlayerState, input: PlayerInput, in
       const mates = state.players.filter((q) => q.role === 'puukottaja' && q.id !== p.id);
       const target = pickPassTarget(p, mates, d);
       if (target) {
-        const angle = Math.atan2(target.y - p.y, target.x - p.x);
-        throwKnife(state, p, angle, p.charge, target.id);
         p.charge = -1;
+        return { kind: 'pass', target };
       }
-      return;
+      return { kind: 'none' };
     }
+  }
+  return { kind: 'none' };
+}
+
+function updateThrowing(state: GameState, p: PlayerState, input: PlayerInput, interactive: boolean): void {
+  const charge = p.charge;
+  const r = updateCharge(state, p, input, interactive);
+  if (r.kind === 'straight') throwKnife(state, p, p.heading, charge, -1);
+  else if (r.kind === 'pass') {
+    throwKnife(state, p, Math.atan2(r.target.y - p.y, r.target.x - p.x), charge, r.target.id);
   }
 }
 
@@ -331,20 +344,25 @@ function updateKnife(state: GameState, arena: Arena): void {
   k.vy *= f;
 }
 
-function groundKnifeInteractions(state: GameState): void {
+/** Push a runner out of the ground knife. Returns true if the player touched it. */
+function groundKnifePush(state: GameState, p: PlayerState): boolean {
   const k = state.knife;
-  if (k.mode !== 'ground') return;
-  const halfL = KNIFE_LENGTH / 2;
-  const halfW = KNIFE_WIDTH / 2;
+  if (k.mode !== 'ground') return false;
+  const push = circleObbPush(p.x, p.y, PLAYER_RADIUS, k.x, k.y, k.heading, KNIFE_LENGTH / 2, KNIFE_WIDTH / 2);
+  if (!push) return false;
+  if (p.role === 'runner') {
+    p.x += push.x;
+    p.y += push.y;
+  }
+  return true;
+}
+
+function groundKnifeInteractions(state: GameState): void {
   for (const p of state.players) {
-    const push = circleObbPush(p.x, p.y, PLAYER_RADIUS, k.x, k.y, k.heading, halfL, halfW);
-    if (!push) continue;
-    if (p.role === 'puukottaja') {
+    if (groundKnifePush(state, p) && p.role === 'puukottaja') {
       pickup(state, p);
       return;
     }
-    p.x += push.x;
-    p.y += push.y;
   }
 }
 
@@ -441,6 +459,24 @@ export function step(state: GameState, inputs: ReadonlyMap<number, PlayerInput>)
     const input = inputs.get(p.id) ?? EMPTY_INPUT;
     p.prevInput = copyInput(input);
   }
+}
+
+/**
+ * Client-side prediction for one locally controlled player. Applies exactly
+ * the movement and charge rules of `step` for that player and nothing else:
+ * no throws, conversions, pickups or body separation. Everything it reads
+ * from `state` (phase, knife holder, conversions, other players) comes from
+ * the last snapshot; only `p` is mutated.
+ */
+export function predictLocalPlayer(state: GameState, p: PlayerState, input: PlayerInput): void {
+  const arena = getArena(state.seed);
+  const phase = state.phase;
+  const frozen = phase === 'countdown' && p.role === 'puukottaja';
+  movePlayer(state, arena, p, input, frozen);
+  if (phase === 'playing' || phase === 'countdown') updateCharge(state, p, input, phase === 'playing');
+  else p.charge = -1;
+  if (phase === 'playing') groundKnifePush(state, p);
+  p.prevInput = copyInput(input);
 }
 
 export function knifeWorldPosition(state: GameState): { x: number; y: number; heading: number } | null {

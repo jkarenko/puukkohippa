@@ -124,7 +124,10 @@ export class GameScene extends Phaser.Scene {
     const puukottajat = state.players.length - runners;
     const secs = Math.max(0, Math.floor((state.tick - state.roundStartTick) / TICK_RATE));
     const mul = runnerSpeedMultiplier(state);
-    const rtt = this.host instanceof NetHost && this.host.rttMs ? ` · ${Math.round(this.host.rttMs)} ms` : '';
+    const st = this.host.stats();
+    const rtt = st
+      ? ` · rtt ${Math.round(st.rttMs)} ms · unacked ${st.unacked} · corr ${st.lastCorrection.toFixed(1)} px`
+      : '';
     this.hud.setText(
       `Round ${state.round} · ${secs}s · Runners ${runners} · Puukottajat ${puukottajat} · runner speed ×${mul.toFixed(2)}\n` +
         `${this.host.status}${rtt}`,

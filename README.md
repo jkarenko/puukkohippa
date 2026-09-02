@@ -32,7 +32,8 @@ pnpm server       # WebSocket server on ws://localhost:8787 (for online rooms)
 - Couch play: open `http://localhost:5173/` and press a throw button on each
   keyboard layout or gamepad you want to join with.
 - Online play: run `pnpm server`, then open `http://localhost:5173/?room=sauna`
-  on every machine. Each machine can still join several local players. Use
+  on every machine. Your own players are predicted locally, so controls feel
+  instant; other players are shown about 120 ms behind. Each machine can still join several local players. Use
   `&server=ws://host:8787` to point at a server on another machine.
 - Production: `pnpm build` then `pnpm start`. The Node server serves the built
   client and the WebSocket endpoint on the same port (`PORT`, default 8787).
@@ -65,3 +66,16 @@ pnpm typecheck    # client + server TypeScript
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the rules in detail, the
 architecture, and the list of tunable constants.
+
+## Hosting on a public server
+
+The Node server binds to all interfaces, so on a machine with a public IP it
+is reachable at `http://<ip>:8787` as soon as the port is open in the
+firewall (`ufw`, plus the cloud provider's firewall if one is attached).
+Run `pnpm build && pnpm start` and open `http://<ip>:8787/?room=sauna`.
+
+Browsers only expose the Gamepad API on secure origins (HTTPS or localhost),
+so gamepads will not work over plain `http://<ip>`; keyboards do. For HTTPS
+without owning a domain, put Caddy in front with an sslip.io name such as
+`157-180-42-208.sslip.io` and `reverse_proxy localhost:8787`; the client
+picks `wss://` on the same host by itself.

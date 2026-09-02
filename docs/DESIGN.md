@@ -32,12 +32,25 @@ src/client   Phaser 4: input slots, host abstraction, renderer, HUD
   and the server run the *same* `Room` class; the browser runs it directly
   for couch play (`LocalHost`) and talks to the server for online play
   (`NetHost`). The scene does not know the difference.
-- Online play is server-authoritative. Clients send their local players'
-  inputs (30 Hz, on change plus keepalive); the server broadcasts full state
-  snapshots at 20 Hz. The client renders about 110 ms behind the newest
-  snapshot and interpolates positions and headings between snapshots. There
-  is no client-side prediction yet; on a LAN this feels fine, over the
-  internet the tank controls will feel slightly delayed.
+- Online play is server-authoritative with client-side prediction for the
+  client's own players. The client runs its own 60 Hz tick loop: each tick it
+  samples the local inputs, sends them with a sequence number, and applies
+  them immediately to a predicted copy of each local player using
+  `predictLocalPlayer`, which is the sim's own movement and charge code
+  (throws, conversions, pickups and body separation stay server-only). The
+  server queues sequenced inputs per player and consumes exactly one per
+  tick (repeating the last one if the queue runs dry, dropping the oldest if
+  more than 8 pile up), so the server applies the same input sequence the
+  client predicted. Snapshots (20 Hz, full state) carry the last applied
+  sequence per player; on each snapshot the client discards acknowledged
+  inputs, rebuilds the prediction from the authoritative state plus the
+  still-pending inputs, and smooths any visual difference out over about
+  60 ms (corrections above 120 px snap). The HUD shows RTT, the number of
+  unacknowledged inputs and the size of the last correction.
+- Remote players and the flying knife are interpolated between snapshots on
+  a server-tick timeline: the client estimates the offset between local time
+  and server ticks from snapshot arrival times (smoothed) and renders 7 ticks
+  (~117 ms) behind, so network jitter does not translate into stutter.
 - Mixed couch + online: every client can register several local players
   (one per control slot). The server tracks which player ids belong to which
   socket and removes them on disconnect.
@@ -59,12 +72,13 @@ on the ground it has a soft shadow so its blocking footprint is visible.
 
 ## Not done yet / ideas
 
-- Client-side prediction and reconciliation for the local players (would
-  make online tank controls feel instant).
 - WebRTC peer-to-peer transport with one browser acting as host; the `Host`
   interface is the seam for it.
 - Sounds, a proper lobby with name/colour selection, scoreboards across
   rounds, spectators.
 - Bots to fill rooms.
-- Delta-compressed snapshots (currently full JSON state at 20 Hz; fine for
-  32 players on a LAN).
+- Delta-compressed or binary snapshots (currently full JSON state at 20 Hz,
+  roughly 200 bytes per player; fine for 32 players on a LAN or a decent
+  connection).
+- Extrapolation of remote players when snapshots are late, and predicting
+  the local player's own throw so the knife leaves the hand instantly.

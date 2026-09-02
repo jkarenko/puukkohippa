@@ -2,7 +2,7 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { extname, join, normalize, resolve } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
-import { DEFAULT_PORT, decode, encode, type ClientMsg, type ServerMsg } from '../src/net/protocol.js';
+import { DEFAULT_PORT, PROTOCOL_VERSION, decode, encode, type ClientMsg, type ServerMsg } from '../src/net/protocol.js';
 import { Room } from '../src/net/room.js';
 import { MAX_PLAYERS, SNAPSHOT_EVERY_TICKS, TICK_RATE } from '../src/sim/constants.js';
 import { hashString } from '../src/sim/rng.js';
@@ -59,7 +59,7 @@ function getRoom(name: string): RoomEntry {
         room.tick();
         if (room.state.tick % SNAPSHOT_EVERY_TICKS === 0) {
           // Events from all ticks since the last snapshot ride along.
-          broadcast(created, { t: 'snapshot', state: room.state, serverTime: Date.now() });
+          broadcast(created, { t: 'snapshot', state: room.state, acks: room.ackRecord() });
           room.flushEvents();
         }
       }
@@ -89,12 +89,16 @@ function handle(c: Client, msg: ClientMsg): void {
   switch (msg.t) {
     case 'hello': {
       leaveRoom(c);
+      if (msg.v !== PROTOCOL_VERSION) {
+        send(c, { t: 'error', message: `protocol v${msg.v} not supported, reload the page` });
+        return;
+      }
       const name = String(msg.room || 'default').slice(0, 32);
       const entry = getRoom(name);
       entry.clients.add(c);
       c.room = name;
-      send(c, { t: 'welcome', room: name });
-      send(c, { t: 'snapshot', state: entry.room.state, serverTime: Date.now() });
+      send(c, { t: 'welcome', room: name, v: PROTOCOL_VERSION });
+      send(c, { t: 'snapshot', state: entry.room.state, acks: entry.room.ackRecord() });
       break;
     }
     case 'join': {
@@ -124,9 +128,11 @@ function handle(c: Client, msg: ClientMsg): void {
       const entry = c.room ? rooms.get(c.room) : undefined;
       if (!entry) return;
       const owned = new Set(c.players.values());
+      const seq = Number(msg.seq);
+      if (!Number.isFinite(seq)) return;
       for (const { id, input } of msg.inputs) {
         if (!owned.has(id)) continue;
-        entry.room.setInput(id, {
+        entry.room.pushInput(id, seq, {
           fwd: !!input.fwd,
           back: !!input.back,
           left: !!input.left,
@@ -137,7 +143,7 @@ function handle(c: Client, msg: ClientMsg): void {
       break;
     }
     case 'ping':
-      send(c, { t: 'pong', sent: msg.sent, serverTime: Date.now() });
+      send(c, { t: 'pong', sent: msg.sent });
       break;
   }
 }

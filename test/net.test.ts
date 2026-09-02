@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { decode, encode, normalizeRoomName } from '../src/net/protocol.js';
-import { MAX_QUEUE, Room } from '../src/net/room.js';
+import { CATCHUP_PER_TICK, MAX_QUEUE, Room } from '../src/net/room.js';
 import { getArena } from '../src/sim/arena.js';
 import { COUNTDOWN_TIME, KNIFE_FLY_RADIUS, KNIFE_RECATCH_DELAY, PLAYER_RADIUS, TICK_RATE } from '../src/sim/constants.js';
 import { createThrow, flyKnife, predictLocalPlayer, separateBodies } from '../src/sim/sim.js';
@@ -32,8 +32,69 @@ describe('Room input queue', () => {
     room.tick();
     expect(room.acks.get(id)).toBe(3);
     expect(room.queued(id)).toBe(0);
-    room.tick(); // queue empty: last input repeats, ack unchanged
+    room.tick(); // queue empty: the player is frozen, ack unchanged
     expect(room.acks.get(id)).toBe(3);
+    expect(room.stats.starvedTicks).toBe(1);
+  });
+
+  it('freezes a starved player and catches up a burst along the identical path', () => {
+    // Reference: inputs applied one per tick without interruption.
+    const ref = new Room(21);
+    const rid = ref.addPlayer('A', 1);
+    ref.addPlayer('B', 2);
+    const stalled = new Room(21);
+    const sid = stalled.addPlayer('A', 1);
+    stalled.addPlayer('B', 2);
+    const warm = COUNTDOWN_TIME * TICK_RATE + 5;
+    for (let i = 0; i < warm; i++) {
+      ref.tick();
+      stalled.tick();
+    }
+    const seqInputs: PlayerInput[] = [];
+    for (let k = 0; k < 90; k++) seqInputs.push(inp({ fwd: true, left: k % 30 < 12, throw: k > 40 && k < 60 }));
+    // Reference stream: one input per tick.
+    seqInputs.forEach((input, i) => {
+      ref.pushInput(rid, i + 1, input);
+      ref.tick();
+    });
+    // Stalled stream: the first 30 arrive normally, then nothing for 40 ticks
+    // (the player must not move), then the remaining 60 arrive at once.
+    for (let i = 0; i < 30; i++) {
+      stalled.pushInput(sid, i + 1, seqInputs[i]!);
+      stalled.tick();
+    }
+    const frozen = stalled.state.players.find((p) => p.id === sid)!;
+    const fx = frozen.x;
+    const fy = frozen.y;
+    for (let i = 0; i < 40; i++) stalled.tick();
+    expect(frozen.x).toBe(fx);
+    expect(frozen.y).toBe(fy);
+    expect(stalled.stats.starvedTicks).toBe(40);
+    for (let i = 30; i < 90; i++) stalled.pushInput(sid, i + 1, seqInputs[i]!);
+    // Catch-up at 3 per tick while the backlog exceeds the threshold, then 1
+    // per tick: 60 inputs take 16 + 12 = 28 ticks. Idle ticks after that freeze again.
+    for (let i = 0; i < 30; i++) stalled.tick();
+    expect(stalled.acks.get(sid)).toBe(90);
+    expect(stalled.stats.catchupInputs).toBeGreaterThan(0);
+    const a = ref.state.players.find((p) => p.id === rid)!;
+    const b = stalled.state.players.find((p) => p.id === sid)!;
+    expect(b.x).toBeCloseTo(a.x, 6);
+    expect(b.y).toBeCloseTo(a.y, 6);
+    expect(b.heading).toBeCloseTo(a.heading, 6);
+    // Both threw the knife with the same charge from the same spot: same landing place.
+    const ka = ref.state.knife as { mode: string; x?: number; y?: number };
+    const kb = stalled.state.knife as { mode: string; x?: number; y?: number };
+    for (let i = 0; i < 200; i++) {
+      ref.tick();
+      stalled.tick();
+    }
+    expect(ref.state.knife.mode).toBe(stalled.state.knife.mode);
+    if (ref.state.knife.mode === 'ground' && stalled.state.knife.mode === 'ground') {
+      expect(stalled.state.knife.x).toBeCloseTo(ref.state.knife.x, 6);
+      expect(stalled.state.knife.y).toBeCloseTo(ref.state.knife.y, 6);
+    }
+    void ka;
+    void kb;
   });
 
   it('ignores stale or duplicate seqs and caps the buffer', () => {
@@ -46,8 +107,10 @@ describe('Room input queue', () => {
     for (let s = 6; s < 6 + MAX_QUEUE + 10; s++) room.pushInput(id, s, inp());
     expect(room.queued(id)).toBe(MAX_QUEUE);
     room.tick();
-    // The oldest were dropped: the first applied seq is the last one minus the cap.
-    expect(room.acks.get(id)).toBe(6 + MAX_QUEUE + 10 - 1 - MAX_QUEUE + 1);
+    // The oldest were dropped, and a full queue is a backlog: the first tick
+    // applies CATCHUP_PER_TICK inputs starting from the oldest kept seq.
+    const oldestKept = 6 + MAX_QUEUE + 10 - 1 - MAX_QUEUE + 1;
+    expect(room.acks.get(id)).toBe(oldestKept + CATCHUP_PER_TICK - 1);
   });
 
   it('strips prevInput from the wire', () => {

@@ -57,13 +57,24 @@ src/client   Phaser 4: input slots, host abstraction, renderer, HUD
   a local player is shown advanced to the present rather than 117 ms behind,
   so it lines up with the predicted thrower; remote throws stay on the
   interpolated timeline, which matches the remote players they interact with.
+- The server never invents input. A player driven by the sequenced stream
+  whose queue is empty is frozen for that tick (no movement, no charge
+  change) instead of repeating their last input; a backlog above 12 inputs
+  (a burst after a stall) is applied at 3 inputs per tick until worked off.
+  The server-side path is therefore always exactly the sequence the client
+  predicted, only shifted in time, so a 300–600 ms stall causes no
+  correction for the stalled player: they keep seeing their own prediction
+  and the server catches up. Other players see them freeze and then
+  fast-forward along the real path. Cost: a deliberately stalled client can
+  compress time along a legal path (lag switching); the 2 s queue cap and 3x
+  catch-up rate bound it, and positions, speeds and hits remain server-side.
 - Clock control (time dilation, the Overwatch approach). Every snapshot
   reports how many of the client's inputs the server still has queued. The
   client runs its 60 Hz tick clock up to 10 % faster or slower to hold that
   depth at a target of measured jitter plus one tick (2 to 8 ticks). A
   buffer that runs dry makes the server repeat the last input, which is a
   guaranteed correction; a buffer that is too deep is pure input latency.
-  The server-side queue cap is 30 inputs (500 ms). A stalled frame is capped
+  The server-side queue cap is 120 inputs (2 s). A stalled frame is capped
   at 100 ms of catch-up so the client never bursts a pile of ticks, and
   snapshots that piled up during a local stall are excluded from the jitter
   estimate.
@@ -119,7 +130,8 @@ src/client   Phaser 4: input slots, host abstraction, renderer, HUD
   session and player names, at most 8 inputs per message. Sessions that
   press nothing for 60 s in the lobby or 3 min in a round are removed. Each
   room logs a stats line every 10 s (tick, phase, players, kB/s out, delta
-  vs full counts, tick overruns, input queue depth per player) and
+  vs full counts, inputs/s per player, starved ticks, catch-up inputs, tick
+  overruns, input queue depth per player) and
   `GET /stats` returns the same as JSON.
 
 ## Rendering

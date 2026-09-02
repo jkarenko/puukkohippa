@@ -210,6 +210,9 @@ export interface NetSim {
   jitterMs: number;
   /** Benchmark knob: disable the input-buffer clock control (fixed 60 Hz tick clock). */
   noClockControl?: boolean;
+  /** Every `stallEveryMs`, hold all traffic for `stallMs` (a TCP retransmit stall). */
+  stallEveryMs?: number;
+  stallMs?: number;
 }
 
 /** FIFO delayed delivery: one timer chain, so entries never overtake each other. */
@@ -239,6 +242,8 @@ export class NetHost implements Host {
   onJoined: Host['onJoined'] = null;
   private readonly simOut = new DelayQueue();
   private readonly simIn = new DelayQueue();
+  private simNextStall = 0;
+  private simStallUntil = 0;
 
   private ws: WebSocket | null = null;
   private readonly snapshots: Snapshot[] = [];
@@ -303,7 +308,16 @@ export class NetHost implements Host {
   private simulate(direction: 'in' | 'out', fn: () => void): void {
     const sim = this.netsim;
     if (!sim) return fn();
-    const at = performance.now() + sim.delayMs + (Math.random() * 2 - 1) * sim.jitterMs;
+    const now = performance.now();
+    let at = now + sim.delayMs + (Math.random() * 2 - 1) * sim.jitterMs;
+    if (sim.stallEveryMs && sim.stallMs) {
+      if (this.simNextStall === 0) this.simNextStall = now + sim.stallEveryMs;
+      if (now >= this.simNextStall) {
+        this.simStallUntil = now + sim.stallMs;
+        this.simNextStall = now + sim.stallEveryMs;
+      }
+      at = Math.max(at, this.simStallUntil + sim.delayMs);
+    }
     (direction === 'in' ? this.simIn : this.simOut).push(at, fn);
   }
 
@@ -551,7 +565,7 @@ export class NetHost implements Host {
       for (const [id, lp] of this.local) {
         const input = copyInput(lp.cur);
         lp.pending.push({ seq: this.clientTick, input });
-        if (lp.pending.length > 120) lp.pending.shift(); // 2 s without acks: stop growing
+        if (lp.pending.length > 600) lp.pending.shift(); // 10 s without acks: stop growing
         batch.push({ id, input });
         if (lp.predicted && latest) {
           const chargeBefore = lp.predicted.charge;

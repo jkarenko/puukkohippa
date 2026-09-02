@@ -1,8 +1,16 @@
 import { addPlayer, createState, dropKnife, findPlayer, removePlayer, step } from '../sim/sim.js';
 import { EMPTY_INPUT, copyInput, type GameEvent, type GameState, type PlayerInput, type Vec } from '../sim/types.js';
 
-/** Inputs buffered ahead of the simulation (500 ms); beyond this the oldest are dropped. The client's clock control keeps the depth near a small jitter-derived target. */
-export const MAX_QUEUE = 30;
+/**
+ * Inputs buffered ahead of the simulation (2 s); beyond this the oldest are
+ * dropped. The client's clock control keeps the depth near a small
+ * jitter-derived target; the room only needs headroom for stall bursts.
+ */
+export const MAX_QUEUE = 120;
+/** Backlog above which the room applies several inputs per tick to catch up. */
+export const CATCHUP_THRESHOLD = 12;
+/** Inputs applied per tick while catching up (3x time compression). */
+export const CATCHUP_PER_TICK = 3;
 /** Position history kept for lag compensation, in ticks. */
 const HISTORY_TICKS = 64;
 /** Never rewind a target further back than this (500 ms). */
@@ -41,6 +49,10 @@ export class Room {
   /** Latest reported view tick per player, updated when their input is applied. */
   private readonly views = new Map<number, number>();
   private readonly history: Array<HistoryEntry | undefined> = new Array(HISTORY_TICKS);
+  /** Players driven by the sequenced input stream (online); they freeze when it runs dry. */
+  private readonly streaming = new Set<number>();
+  /** Diagnostics: ticks in which a streaming player had no input, and inputs applied in catch-up. */
+  readonly stats = { starvedTicks: 0, catchupInputs: 0 };
   /** Lag compensation hook handed to the sim; see `rewind`. */
   private readonly rewindHook = (viewer: number, target: number): Vec | null => this.rewind(viewer, target);
 
@@ -64,6 +76,7 @@ export class Room {
     this.acks.delete(id);
     this.owners.delete(id);
     this.views.delete(id);
+    this.streaming.delete(id);
   }
 
   /**
@@ -111,6 +124,7 @@ export class Room {
     if (!q || !findPlayer(this.state, id)?.connected) return;
     const last = q.length ? q[q.length - 1]!.seq : (this.acks.get(id) ?? 0);
     if (seq <= last) return;
+    this.streaming.add(id);
     q.push({ seq, input: copyInput(input), view });
     if (q.length > MAX_QUEUE) q.splice(0, q.length - MAX_QUEUE);
   }
@@ -121,15 +135,27 @@ export class Room {
   }
 
   tick(): void {
+    // The server never invents input: a streaming player whose queue is empty
+    // is frozen for the tick, and a backlog (inputs that arrived in a burst
+    // after a stall) is worked off several per tick. Either way the player's
+    // path is exactly the sequence the client predicted, only shifted in time.
+    const sequences = new Map<number, PlayerInput[]>();
     for (const [id, q] of this.queues) {
-      const next = q.shift();
-      if (next) {
+      if (!this.streaming.has(id)) continue;
+      const n = q.length > CATCHUP_THRESHOLD ? Math.min(CATCHUP_PER_TICK, q.length) : Math.min(1, q.length);
+      const batch: PlayerInput[] = [];
+      for (let i = 0; i < n; i++) {
+        const next = q.shift()!;
+        batch.push(next.input);
         this.inputs.set(id, next.input);
         this.acks.set(id, next.seq);
         if (next.view !== null) this.views.set(id, next.view);
       }
+      if (n === 0) this.stats.starvedTicks++;
+      else if (n > 1) this.stats.catchupInputs += n - 1;
+      sequences.set(id, batch);
     }
-    step(this.state, this.inputs, { rewind: this.rewindHook });
+    step(this.state, this.inputs, { rewind: this.rewindHook, sequences });
     const pos = new Map<number, Vec>();
     for (const p of this.state.players) pos.set(p.id, { x: p.x, y: p.y });
     this.history[this.state.tick % HISTORY_TICKS] = { tick: this.state.tick, pos };

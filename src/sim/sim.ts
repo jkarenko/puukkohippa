@@ -33,6 +33,7 @@ import {
   type FlyingKnife,
   type GameState,
   type KnifeState,
+  type Phase,
   type PlayerInput,
   type PlayerState,
   type ThrowIntent,
@@ -450,6 +451,13 @@ export interface StepOptions {
    * use the live position. Only touch and knife-hit checks consult this.
    */
   rewind?: (viewerId: number, targetId: number) => Vec | null;
+  /**
+   * Per-player input sequence for this tick, overriding `inputs`: an empty
+   * array freezes the player (their inputs have not arrived; the server
+   * never invents one), several inputs apply in order in a single tick
+   * (catching up after a stall). Absent players use `inputs` as usual.
+   */
+  sequences?: ReadonlyMap<number, readonly PlayerInput[]>;
 }
 
 const NO_REWIND: StepOptions = {};
@@ -481,14 +489,14 @@ export function step(state: GameState, inputs: ReadonlyMap<number, PlayerInput>,
 
   const phase = state.phase;
   const interactive = phase === 'playing';
-  const playing = phase === 'playing' || phase === 'countdown';
 
   for (const p of state.players) {
-    const input = inputs.get(p.id) ?? EMPTY_INPUT;
-    const frozen = phase === 'countdown' && p.role === 'puukottaja';
-    movePlayer(state, arena, p, input, frozen);
-    if (playing) updateThrowing(state, p, input, interactive);
-    else p.charge = -1;
+    const seq = opts.sequences?.get(p.id);
+    if (seq) {
+      for (const input of seq) applyInput(state, arena, p, input, phase);
+    } else {
+      applyInput(state, arena, p, inputs.get(p.id) ?? EMPTY_INPUT, phase);
+    }
   }
 
   const rewind = opts.rewind ?? null;
@@ -515,10 +523,15 @@ export function step(state: GameState, inputs: ReadonlyMap<number, PlayerInput>,
     }
   }
 
-  for (const p of state.players) {
-    const input = inputs.get(p.id) ?? EMPTY_INPUT;
-    p.prevInput = copyInput(input);
-  }
+}
+
+/** One input's worth of movement and throwing for one player; `prevInput` tracks the last applied input. */
+function applyInput(state: GameState, arena: Arena, p: PlayerState, input: PlayerInput, phase: Phase): void {
+  const frozen = phase === 'countdown' && p.role === 'puukottaja';
+  movePlayer(state, arena, p, input, frozen);
+  if (phase === 'playing' || phase === 'countdown') updateThrowing(state, p, input, phase === 'playing');
+  else p.charge = -1;
+  p.prevInput = copyInput(input);
 }
 
 /**

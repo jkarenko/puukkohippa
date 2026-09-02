@@ -128,9 +128,12 @@ function logStats(name: string, entry: RoomEntry): void {
       `sessions ${entry.sessions.size} sockets ${entry.clients.size} ` +
       `out ${(st.bytesOut / secs / 1024).toFixed(1)} kB/s (${st.deltas} delta, ${st.snapshots} full) ` +
       `in ${(st.inputsIn / secs / Math.max(1, entry.room.playerCount)).toFixed(1)} inputs/s/player ` +
+      `starved ${entry.room.stats.starvedTicks} catchup ${entry.room.stats.catchupInputs} ` +
       `overruns ${st.overruns} queues [${queues}]`,
   );
   entry.stats = { bytesOut: 0, inputsIn: 0, snapshots: 0, deltas: 0, overruns: 0, loggedAt: now };
+  entry.room.stats.starvedTicks = 0;
+  entry.room.stats.catchupInputs = 0;
 }
 
 function getRoom(name: string): RoomEntry {

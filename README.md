@@ -32,7 +32,7 @@ pnpm server       # WebSocket server on ws://localhost:8787 (for online rooms)
 - Couch play: open `http://localhost:5173/` and press a throw button on each
   keyboard layout or gamepad you want to join with.
 - Online play: run `pnpm server`, then open `http://localhost:5173/?room=sauna`
-  on every machine. Your own players are predicted locally, so controls feel
+  (or `http://localhost:5173/sauna`) on every machine. Your own players are predicted locally, so controls feel
   instant; other players are shown about 120 ms behind. If your connection
   drops, your players wait 10 s for you to reconnect before they are removed.
   `GET /stats` on the server shows rooms, players and input queue depths. Each machine can still join several local players. Use
@@ -55,7 +55,7 @@ Up to 32 players per room.
 
 | Parameter | Meaning                                                   |
 | --------- | --------------------------------------------------------- |
-| `room`    | Join an online room with this name. Omit for couch mode.  |
+| `room`    | Join an online room with this name. Omit for couch mode. The first path segment (`/sauna`) works too, for redirects that drop the query string. |
 | `server`  | WebSocket URL of the server (default: same host, port 8787 in dev). |
 | `seed`    | Arena seed for couch mode, any string.                    |
 | `netsim`  | `delay,jitter` in ms: artificial latency for testing online play. |

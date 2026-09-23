@@ -58,3 +58,22 @@ export function normalizeRoomName(raw: string | null | undefined): string {
     .slice(0, 32);
   return cleaned || 'default';
 }
+
+/**
+ * Room named by a page URL: `?room=sauna` wins, otherwise the first path
+ * segment (`/sauna`), so a link survives redirects that drop the query
+ * string. Null means couch mode (no room at all).
+ */
+export function roomFromLocation(search: string, pathname: string): string | null {
+  const q = new URLSearchParams(search);
+  if (q.has('room')) return normalizeRoomName(q.get('room'));
+  const segment = pathname.split('/').find((s) => s.length > 0) ?? '';
+  let decoded = segment;
+  try {
+    decoded = decodeURIComponent(segment);
+  } catch {
+    /* keep the raw segment */
+  }
+  if (!decoded || decoded === 'index.html') return null;
+  return normalizeRoomName(decoded);
+}

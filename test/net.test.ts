@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decode, encode, normalizeRoomName } from '../src/net/protocol.js';
+import { decode, encode, normalizeRoomName, roomFromLocation } from '../src/net/protocol.js';
 import { CATCHUP_PER_TICK, MAX_QUEUE, Room } from '../src/net/room.js';
 import { getArena } from '../src/sim/arena.js';
 import { COUNTDOWN_TIME, KNIFE_FLY_RADIUS, KNIFE_RECATCH_DELAY, PLAYER_RADIUS, TICK_RATE } from '../src/sim/constants.js';
@@ -361,6 +361,17 @@ describe('room names', () => {
     expect(normalizeRoomName('')).toBe('default');
     expect(normalizeRoomName(null)).toBe('default');
     expect(normalizeRoomName('x'.repeat(50))).toHaveLength(32);
+  });
+
+  it('reads the room from the query string or, failing that, the path', () => {
+    expect(roomFromLocation('?room=Sauna', '/')).toBe('sauna');
+    expect(roomFromLocation('', '/Sauna')).toBe('sauna');
+    expect(roomFromLocation('', '/sauna/')).toBe('sauna');
+    expect(roomFromLocation('', '/l%C3%B6yly')).toBe('löyly');
+    expect(roomFromLocation('?room=kota', '/sauna')).toBe('kota');
+    expect(roomFromLocation('?seed=1', '/')).toBeNull();
+    expect(roomFromLocation('', '/index.html')).toBeNull();
+    expect(roomFromLocation('?room=', '/')).toBe('default');
   });
 });
 

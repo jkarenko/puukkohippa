@@ -10,6 +10,8 @@ import { hashString } from '../src/sim/rng.js';
 import type { GameState } from '../src/sim/types.js';
 
 const PORT = Number(process.env['PORT'] ?? DEFAULT_PORT);
+// Loopback only: Caddy proxies both the dev and the production hostnames to this port.
+const HOST = process.env['HOST'] ?? '127.0.0.1';
 const DIST = resolve(process.cwd(), 'dist');
 
 /** How long a dropped connection keeps its players before they are removed. */
@@ -421,6 +423,6 @@ setInterval(() => {
   }
 }, HEARTBEAT_MS);
 
-http.listen(PORT, () => {
-  console.log(`Puukkohippa server listening on http://0.0.0.0:${PORT} (ws on the same port)`);
+http.listen(PORT, HOST, () => {
+  console.log(`Puukkohippa server listening on http://${HOST}:${PORT} (ws on the same port)`);
 });
